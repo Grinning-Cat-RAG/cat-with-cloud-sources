@@ -1,0 +1,10 @@
+[project]
+name = "cat-with-cloud-sources"
+version = "0.1.0"
+requires-python = ">=3.11,<3.14"
+# httpx and pydantic are provided by the Grinning Cat core
+dependencies = [
+    "fastapi",
+    "httpx",
+    "pydantic",
+]

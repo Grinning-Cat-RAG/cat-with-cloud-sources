@@ -1,0 +1,9 @@
+{
+    "name": "Cat with Cloud Sources",
+    "version": "0.2.0",
+    "description": "Ingest files from Google Drive, Amazon S3, Azure Blob Storage or pre-signed URLs, using short-lived credentials passed by the backend, with per-user visibility on recall.",
+    "author_name": "Matteo Cacciola",
+    "author_url": "https://github.com/matteocacciola",
+    "plugin_url": "https://github.com/matteocacciola/cat_with_google_drive",
+    "tags": "google drive, s3, azure blob, presigned url, connectors, file ingestion, memory, rabbithole, acl"
+}
