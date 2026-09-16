@@ -22,6 +22,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, List, Set, Type
 
 from cat import log
@@ -261,7 +262,7 @@ class ConnectorIngestionPipeline:
     ) -> _Downloaded | None:
         path = os.path.join(workdir, f"{next(self._file_counter)}.bin")
         try:
-            with open(path, "wb") as fh:
+            with Path(path).open("wb") as fh:
                 result = await connector.download(item, fh)
         except (UnsupportedItemError, ItemTooLargeError, ItemNotFoundError) as e:
             if isinstance(e, ItemTooLargeError):
@@ -313,8 +314,7 @@ class ConnectorIngestionPipeline:
                     item_extra=item.extra_metadata,
                     user_metadata=job.user_metadata,
                 )
-                with open(entry.path, "rb") as fh:
-                    content = BytesIO(fh.read())
+                content = BytesIO(Path(entry.path).read_bytes())
 
                 await engine(
                     cat=self._target,
