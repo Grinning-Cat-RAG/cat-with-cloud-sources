@@ -29,6 +29,21 @@ Each request starts a background job with two phases:
 
 A slow embedding phase therefore cannot outlive the token, and a failed ingestion never loses the existing content.
 
+### Token expiry
+
+The plugin never refreshes a credential: it never receives a refresh token. Refreshing is the backend's job.
+
+- **Before the job.** A credential whose `expires_at` falls within the next 30 seconds is rejected with `400`.
+- **During phase 1.** `expires_at` is checked again before every request, retries included. If the provider answers that the credential is invalid or expired, the job stops in the same way.
+- **When phase 1 stops.** No more items are listed or downloaded, but the files already downloaded are still ingested. The job report records the reason as `aborted`.
+- **Phase 2** never needs the credential, so an expiring token cannot interrupt it.
+
+`presigned_url` has no credential, so none of this applies to it: an expired signature fails only its own object.
+
+`expires_at` is optional. Without it, the plugin only notices an expired token when the provider rejects it. Always send it when you know it.
+
+If phase 1 may outlast the token (large folders, big files), refresh the token right before calling the Cat. If a job is aborted, send the same request again with a new token: items already ingested at the same version are skipped as unchanged.
+
 ## Security model
 
 - **Credentials are ephemeral.** They exist in memory only for the duration of phase 1. They are never written to settings, logs, metadata, prompts or responses. Secrets are `SecretStr`, and validation errors never echo the input (the request body is validated manually for this reason).
@@ -70,7 +85,7 @@ Response (`202`):
 { "job_id": "9f1c...", "provider": "google_drive", "references": 2, "visibility": "owner", "scope": "agent", "info": "..." }
 ```
 
-Invalid or expired credentials, malformed references and URLs outside the allowed hosts are rejected with `400` before the job starts. The job outcome is logged with its `job_id`: discovered, unchanged, unsupported, over limit, downloaded, ingested and failed counts, plus `truncated` when a limit stopped the enumeration. The Cat's standard ingestion hooks and webhooks keep working, because files go through the regular ingestion engine.
+Invalid or expired credentials, malformed references and URLs outside the allowed hosts are rejected with `400` before the job starts. The job outcome is logged with its `job_id`: discovered, unchanged, unsupported, over limit, downloaded, ingested and failed counts, plus `truncated` when a limit stopped the enumeration and `aborted` with the reason when the job stopped early (for example, an expired credential). The Cat's standard ingestion hooks and webhooks keep working, because files go through the regular ingestion engine.
 
 ### `GET /custom/connectors/providers`
 
