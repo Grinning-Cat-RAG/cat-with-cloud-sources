@@ -29,7 +29,9 @@ from .base import (
     RetryableError,
     SourceCredential,
     SourceItem,
+    has_dot_segments,
     resolve_mime_type,
+    within_prefix,
 )
 
 NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
@@ -70,6 +72,8 @@ def parse_s3_reference(reference: str) -> Tuple[str, str]:
     bucket, key = parts.netloc, parts.path.lstrip("/")
     if not _BUCKET_RE.match(bucket) or ".." in bucket:
         raise ItemNotFoundError("Invalid S3 bucket name")
+    if has_dot_segments(key):
+        raise ItemNotFoundError("S3 references with '.' or '..' path segments are not supported")
     return bucket, key
 
 
@@ -220,6 +224,17 @@ class S3Connector(HttpSourceConnector[S3Credential]):
             extra_metadata={"s3_bucket": bucket, "s3_key": key},
             download_hints={"bucket": bucket, "key": key},
         )
+
+    async def in_scope(self, item: SourceItem) -> bool:
+        bucket, key = item.download_hints["bucket"], item.download_hints["key"]
+        for reference in self._references:
+            try:
+                ref_bucket, ref_key = parse_s3_reference(reference)
+            except ItemNotFoundError:
+                continue
+            if ref_bucket == bucket and within_prefix(key, ref_key):
+                return True
+        return False
 
     # -- download --------------------------------------------------------------
     async def download(self, item: SourceItem, destination: BinaryIO) -> DownloadResult:

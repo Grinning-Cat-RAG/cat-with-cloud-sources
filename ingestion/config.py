@@ -1,13 +1,15 @@
 """Plugin configuration model.
 
 User credentials are per request and ephemeral. The only secrets here are the optional
-OAuth client secrets, used to refresh Google Drive and Azure (Entra ID) access tokens:
-their keys end with ``_secret``, so the core masks them towards readers without write
-permission.
+OAuth client secrets, used to refresh Google Drive and Azure (Entra ID) access tokens.
+The core stores plugin settings as they are, so the plugin encrypts them itself
+(``encrypt_secrets``/``decrypt_secrets``, wired to the core ``StringCrypto`` in
+``settings.py``). Their keys contain ``_secret``, so the core also masks them towards
+readers without write permission.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, Literal
+from typing import Any, Dict, List, Literal, Protocol, Tuple
 
 from pydantic import BaseModel, Field, SecretStr
 
@@ -106,6 +108,44 @@ class ConnectorsSettings(BaseModel):
     @classmethod
     def from_raw(cls, raw: Dict[str, Any] | None) -> "ConnectorsSettings":
         return cls.model_validate(raw or {})
+
+
+#: settings encrypted at rest: every field whose key contains "_secret"
+SECRET_SETTINGS = ("google_oauth_client_secret", "azure_client_secret")
+
+
+class Crypto(Protocol):
+    def encrypt(self, plaintext: str) -> str: ...
+
+    def decrypt(self, ciphertext: str) -> str: ...
+
+
+def encrypt_secrets(settings: Dict[str, Any], crypto: Crypto) -> Dict[str, Any]:
+    """Copy of ``settings`` with the non-empty secrets encrypted (empty means not configured)."""
+    return {
+        k: crypto.encrypt(v) if k in SECRET_SETTINGS and isinstance(v, str) and v else v
+        for k, v in settings.items()
+    }
+
+
+def decrypt_secrets(settings: Dict[str, Any], crypto: Crypto) -> Tuple[Dict[str, Any], List[str]]:
+    """Copy of ``settings`` with the secrets decrypted, and the keys that could not be decrypted.
+
+    An undecryptable secret (e.g. ``CAT_CRYPTO_KEY`` changed) becomes empty: the feature it
+    enables is off until the secret is saved again, and the rest of the settings keeps working.
+    """
+    decrypted = dict(settings)
+    failed: List[str] = []
+    for key in SECRET_SETTINGS:
+        value = decrypted.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            decrypted[key] = crypto.decrypt(value)
+        except Exception:  # noqa: BLE001 - Fernet raises InvalidToken, base64 raises ValueError
+            decrypted[key] = ""
+            failed.append(key)
+    return decrypted, failed
 
 
 async def load_connectors_settings(plugin, agent_id: str) -> ConnectorsSettings:

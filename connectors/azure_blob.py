@@ -36,7 +36,9 @@ from .base import (
     SourceCredential,
     SourceItem,
     TokenRejectedError,
+    has_dot_segments,
     resolve_mime_type,
+    within_prefix,
 )
 
 API_VERSION = "2023-11-03"
@@ -137,6 +139,8 @@ class AzureBlobConnector(HttpSourceConnector[AzureBlobCredential]):
         container, _, name = reference.lstrip("/").partition("/")
         if not _CONTAINER_RE.match(container):
             raise ItemNotFoundError("Invalid Azure container name")
+        if has_dot_segments(name):
+            raise ItemNotFoundError("Azure references with '.' or '..' path segments are not supported")
         return container, name
 
     # -- auth / errors ---------------------------------------------------------
@@ -277,6 +281,17 @@ class AzureBlobConnector(HttpSourceConnector[AzureBlobCredential]):
             extra_metadata={"azure_container": container, "azure_blob": name},
             download_hints={"container": container, "name": name},
         )
+
+    async def in_scope(self, item: SourceItem) -> bool:
+        container, name = item.download_hints["container"], item.download_hints["name"]
+        for reference in self._references:
+            try:
+                ref_container, ref_name = self.parse_reference(reference, self._credential.account_url)
+            except ItemNotFoundError:
+                continue
+            if ref_container == container and within_prefix(name, ref_name):
+                return True
+        return False
 
     # -- download --------------------------------------------------------------
     async def download(self, item: SourceItem, destination: BinaryIO) -> DownloadResult:

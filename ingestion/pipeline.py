@@ -1,8 +1,8 @@
 """Two-phase ingestion of connector items.
 
-Phase 1 (needs the credential): enumerate, skip unchanged items, download into a
-private temporary directory. When it ends the connector is closed and the
-credential reference is dropped.
+Phase 1 (needs the credential): enumerate, drop items outside the requested
+references, skip unchanged items, download into a private temporary directory.
+When it ends the connector is closed and the credential reference is dropped.
 
 Phase 2 (no credential): ingest every downloaded file through the configured
 ingestion engine, then remove the chunks of the previous version of the item.
@@ -82,6 +82,7 @@ class JobReport:
     downloaded: int = 0
     ingested: int = 0
     failed: int = 0
+    out_of_scope: int = 0
     truncated: bool = False
     aborted_reason: str | None = None
     errors: List[str] = field(default_factory=list)
@@ -94,7 +95,8 @@ class JobReport:
         return (
             f"job={self.job_id} provider={self.provider} discovered={self.discovered} "
             f"unchanged={self.unchanged} unsupported={self.unsupported} over_limit={self.over_limit} "
-            f"downloaded={self.downloaded} ingested={self.ingested} failed={self.failed}"
+            f"downloaded={self.downloaded} ingested={self.ingested} failed={self.failed} "
+            f"out_of_scope={self.out_of_scope}"
             + (" truncated=true" if self.truncated else "")
             + (f" aborted='{self.aborted_reason}'" if self.aborted_reason else "")
         )
@@ -197,7 +199,7 @@ class ConnectorIngestionPipeline:
         seen: Set[str] = set()
         total_bytes = 0
 
-        async with connector_cls(credential, options) as connector:
+        async with connector_cls(credential, options, references=job.references) as connector:
             for reference in job.references:
                 if report.truncated:
                     break
@@ -214,6 +216,11 @@ class ConnectorIngestionPipeline:
                             break
                         report.discovered += 1
 
+                        # the credential may reach far more than the references: never go beyond them
+                        if not await connector.in_scope(item):
+                            report.out_of_scope += 1
+                            report.add_error(f"{item.path or item.item_id}: outside the requested references, skipped")
+                            continue
                         if item.mime_type_known and item.mime_type not in self._accepted:
                             report.unsupported += 1
                             continue

@@ -12,11 +12,14 @@ Layers:
 - ``SourceCredential``: pydantic model for the credential. Secrets are ``SecretStr``
   and validation errors never echo the input, so tokens cannot leak via logs,
   reprs or 422 responses.
-- ``SourceConnector``: the provider-neutral contract (``iter_items`` + ``download``).
+- ``SourceConnector``: the provider-neutral contract (``iter_items`` + ``in_scope`` + ``download``).
 - ``HttpSourceConnector``: shared plumbing for REST-based providers (async httpx
   client, bounded streaming, HTTP status -> connector error mapping).
 
 Security contract for every implementation:
+- touch only the requested references: the credential may allow much more, so
+  ``in_scope`` must confirm every item before it is downloaded, and containers
+  outside the references must never be listed;
 - never log, persist or return the credential;
 - never put the credential into item metadata;
 - raise ``CredentialError`` on 401/403 so the job can stop early (``TokenRejectedError``
@@ -226,6 +229,25 @@ class ConnectorOptions:
     oauth_clients: Mapping[str, OAuthClient] = field(default_factory=dict)
 
 
+def has_dot_segments(path: str) -> bool:
+    """True if ``path`` has ``.`` or ``..`` segments: httpx resolves them, so the request
+    would reach a different object than the one named (e.g. ``shared/../admin/x``)."""
+    return any(segment in (".", "..") for segment in path.split("/"))
+
+
+def within_prefix(name: str, reference: str) -> bool:
+    """Whether the object ``name`` is covered by a key/prefix reference of a flat namespace.
+
+    An empty reference covers everything; ``docs/`` covers ``docs/...``; ``docs`` covers
+    the object ``docs`` and ``docs/...`` (it may be either), never ``docs-other``.
+    """
+    if has_dot_segments(name):
+        return False
+    if not reference:
+        return True
+    return name == reference or name.startswith(reference if reference.endswith("/") else f"{reference}/")
+
+
 def resolve_mime_type(declared: str | None, name: str, accepted: Iterable[str]) -> str:
     """Pick the MIME type to use for a file: the declared one if the Cat can parse it,
     otherwise the one guessed from the extension (storages often declare octet-stream)."""
@@ -254,9 +276,11 @@ class SourceConnector(ABC, Generic[CredentialT]):
     #: short description of what a "reference" is for this provider
     reference_help: ClassVar[str] = ""
 
-    def __init__(self, credential: CredentialT, options: ConnectorOptions):
+    def __init__(self, credential: CredentialT, options: ConnectorOptions, references: Sequence[str] = ()):
+        """``references`` are all the references of the job: the scope checked by ``in_scope``."""
         self._credential = credential
         self.options = options
+        self._references = tuple(references)
         self._refresh_lock = asyncio.Lock()
 
     @classmethod
@@ -355,6 +379,13 @@ class SourceConnector(ABC, Generic[CredentialT]):
         """
 
     @abstractmethod
+    async def in_scope(self, item: SourceItem) -> bool:
+        """Whether ``item`` belongs to one of the job references (the scope given at construction).
+
+        Checked before every download. Must fail closed: no references means nothing in scope.
+        """
+
+    @abstractmethod
     async def download(self, item: SourceItem, destination: BinaryIO) -> DownloadResult:
         """Write the content of ``item`` into ``destination``.
 
@@ -378,8 +409,8 @@ class HttpSourceConnector(SourceConnector[CredentialT], ABC):
     FOLLOW_REDIRECTS: ClassVar[bool] = False
     RETRYABLE_STATUSES: ClassVar[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
 
-    def __init__(self, credential: CredentialT, options: ConnectorOptions):
-        super().__init__(credential, options)
+    def __init__(self, credential: CredentialT, options: ConnectorOptions, references: Sequence[str] = ()):
+        super().__init__(credential, options, references)
         self._client: httpx.AsyncClient | None = None
 
     def _auth_headers(self, method: str, url: str, params: Dict[str, Any]) -> Dict[str, str]:

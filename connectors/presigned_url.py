@@ -18,12 +18,14 @@ from uuid import uuid4
 import httpx
 
 from .base import (
+    ConnectorError,
     ConnectorOptions,
     DownloadResult,
     HttpSourceConnector,
     ItemNotFoundError,
     SourceCredential,
     SourceItem,
+    has_dot_segments,
     resolve_mime_type,
 )
 
@@ -43,7 +45,14 @@ class PresignedUrlConnector(HttpSourceConnector[PresignedUrlCredential]):
         cls, credential: SourceCredential, references: Sequence[str], options: ConnectorOptions
     ) -> None:
         for reference in references:
-            cls.check_url(reference, options, "pre-signed URL")
+            cls._check_reference(reference, options)
+
+    @classmethod
+    def _check_reference(cls, url: str, options: ConnectorOptions) -> None:
+        cls.check_url(url, options, "pre-signed URL")
+        # httpx resolves dot segments: a container-wide SAS would then reach another blob
+        if has_dot_segments(unquote(urlsplit(url).path)):
+            raise ConnectorError("Pre-signed URLs with '.' or '..' path segments are not supported")
 
     @staticmethod
     def _identity(url: str) -> tuple[str, str]:
@@ -54,7 +63,7 @@ class PresignedUrlConnector(HttpSourceConnector[PresignedUrlCredential]):
         return f"{parts.scheme}://{host}{path}", f"{host}{unquote(path)}"
 
     async def iter_items(self, reference: str, recursive: bool = True) -> AsyncIterator[SourceItem]:
-        self.check_url(reference, self.options, "pre-signed URL")
+        self._check_reference(reference, self.options)
         item_id, display_path = self._identity(reference)
         name = posixpath.basename(unquote(urlsplit(reference).path)) or "download"
         mime_type = resolve_mime_type(None, name, self.options.accepted_mime_types)
@@ -69,6 +78,10 @@ class PresignedUrlConnector(HttpSourceConnector[PresignedUrlCredential]):
             path=display_path,
             download_hints={"url": reference},
         )
+
+    async def in_scope(self, item: SourceItem) -> bool:
+        # each reference is exactly one object: nothing else is ever reachable
+        return item.download_hints.get("url") in self._references
 
     def _accepted_or_guess(self, content_type: str | None, name: str) -> str:
         return resolve_mime_type(content_type, name, self.options.accepted_mime_types)

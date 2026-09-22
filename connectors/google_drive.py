@@ -12,13 +12,14 @@ no blocking client library.
 from __future__ import annotations
 
 import re
-from typing import Any, AsyncIterator, BinaryIO, ClassVar, Dict, List, Set, Tuple
+from typing import Any, AsyncIterator, BinaryIO, ClassVar, Dict, List, Sequence, Set, Tuple
 
 import httpx
 from pydantic import SecretStr
 
 from .base import (
     ConnectorError,
+    ConnectorOptions,
     CredentialError,
     DownloadResult,
     HttpSourceConnector,
@@ -38,7 +39,7 @@ SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
 GOOGLE_APPS_PREFIX = "application/vnd.google-apps."
 
 FILE_FIELDS = (
-    "id,name,mimeType,size,modifiedTime,md5Checksum,version,webViewLink,trashed,"
+    "id,name,mimeType,parents,size,modifiedTime,md5Checksum,version,webViewLink,trashed,"
     "shortcutDetails(targetId,targetMimeType),capabilities(canDownload)"
 )
 
@@ -82,6 +83,21 @@ class GoogleDriveConnector(HttpSourceConnector[GoogleDriveCredential]):
     # -- credential / errors ---------------------------------------------------
     # Drive answers downloads with redirects to googleusercontent.com
     FOLLOW_REDIRECTS: ClassVar[bool] = True
+
+    def __init__(
+        self, credential: GoogleDriveCredential, options: ConnectorOptions, references: Sequence[str] = ()
+    ):
+        super().__init__(credential, options, references)
+        #: ids whose whole subtree is in scope: the references, plus the targets of referenced shortcuts
+        self._scope_roots: Set[str] = set()
+        for reference in self._references:
+            try:
+                self._scope_roots.add(self.parse_reference(reference))
+            except ItemNotFoundError:
+                continue
+        #: folders reached from a scope root: their children are in scope without further checks
+        self._inside: Set[str] = set()
+        self._parents_cache: Dict[str, List[str]] = {}
 
     async def _obtain_refreshed_credential(self) -> GoogleDriveCredential:
         credential = self._credential
@@ -157,7 +173,10 @@ class GoogleDriveConnector(HttpSourceConnector[GoogleDriveCredential]):
                 return
 
     async def iter_items(self, reference: str, recursive: bool = True) -> AsyncIterator[SourceItem]:
-        root = await self._get_file(self.parse_reference(reference))
+        root_id = self.parse_reference(reference)
+        if root_id not in self._scope_roots:
+            raise ConnectorError("The reference is not among the job references")
+        root = await self._get_file(root_id)
         visited: Set[str] = set()
         async for item in self._walk(root, path="", depth=0, recursive=recursive, visited=visited):
             yield item
@@ -177,6 +196,12 @@ class GoogleDriveConnector(HttpSourceConnector[GoogleDriveCredential]):
                 target = await self._get_file(target_id)
             except ItemNotFoundError:
                 return
+            if depth == 0 and meta["id"] in self._scope_roots:
+                # a shortcut given as reference: its target is what was requested
+                self._scope_roots.add(target["id"])
+            elif target["mimeType"] == FOLDER_MIME and not await self._within_scope(target):
+                # never list a folder outside the references; files are rejected by in_scope
+                return
             async for item in self._walk(target, path, depth, recursive, visited):
                 yield item
             return
@@ -189,6 +214,8 @@ class GoogleDriveConnector(HttpSourceConnector[GoogleDriveCredential]):
                 return
             if depth >= self.options.max_depth:
                 return
+            # reached from a scope root (directly, or through a shortcut checked above)
+            self._inside.add(meta["id"])
             async for child in self._list_children(meta["id"]):
                 async for item in self._walk(child, current_path, depth + 1, recursive, visited):
                     yield item
@@ -196,9 +223,46 @@ class GoogleDriveConnector(HttpSourceConnector[GoogleDriveCredential]):
 
         yield self._to_item(meta, current_path)
 
+    # -- scope -----------------------------------------------------------------
+    async def in_scope(self, item: SourceItem) -> bool:
+        return await self._within_scope({"id": item.item_id, "parents": item.download_hints.get("parents")})
+
+    async def _within_scope(self, meta: Dict[str, Any]) -> bool:
+        """Whether the file is a scope root or descends from one (walking up its parents)."""
+        known_parents = {meta["id"]: meta.get("parents")}
+        frontier = [meta["id"]]
+        seen: Set[str] = set()
+        for _ in range(self.options.max_depth + 1):
+            upper: List[str] = []
+            for file_id in frontier:
+                if file_id in self._scope_roots or file_id in self._inside:
+                    return True
+                if file_id in seen:
+                    continue
+                seen.add(file_id)
+                parents = known_parents.get(file_id)
+                upper.extend(parents if parents is not None else await self._parents(file_id))
+            if not upper:
+                return False
+            frontier = upper
+        return False
+
+    async def _parents(self, file_id: str) -> List[str]:
+        if file_id not in self._parents_cache:
+            try:
+                meta = await self._get_json(
+                    f"{API_BASE}/files/{file_id}",
+                    {"fields": "parents", "supportsAllDrives": "true"},
+                    "reading Drive file parents",
+                )
+                self._parents_cache[file_id] = list(meta.get("parents") or [])
+            except ItemNotFoundError:
+                self._parents_cache[file_id] = []
+        return self._parents_cache[file_id]
+
     def _to_item(self, meta: Dict[str, Any], path: str) -> SourceItem:
         mime = meta["mimeType"]
-        hints: Dict[str, Any] = {}
+        hints: Dict[str, Any] = {"parents": list(meta.get("parents") or [])}
         name = meta["name"]
 
         if mime.startswith(GOOGLE_APPS_PREFIX):

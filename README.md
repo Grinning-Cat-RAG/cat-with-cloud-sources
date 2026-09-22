@@ -71,6 +71,13 @@ If phase 1 may outlast the token (large folders, big files), refresh the token r
 - **ACL metadata cannot be spoofed.** Keys starting with `connector_` and core keys (`source`, `chat_id`, ...) are stripped from caller metadata.
 - **No SSRF.** Every caller-provided URL (pre-signed URLs, custom S3 endpoints, Azure account URLs) must use HTTPS and match `allowed_url_hosts`. IP literals and credentials embedded in URLs are refused, and redirects are not followed except by the Google Drive connector.
 - **No secrets in the logs.** httpx logs every request URL, and query strings may carry SAS tokens or signatures, so the plugin strips them from httpx log records. Pre-signed URLs are treated as secrets: only their host and path are stored or reported.
+- **Only the requested references.** A token or a refresh token often grants access to the whole storage, so the Cat limits itself to the references of the request. Every item is checked against them before it is downloaded, and containers outside them are never listed. An item outside the references is skipped and counted as `out_of_scope`. In detail:
+  - Google Drive: a shortcut is followed only if its target lies inside a referenced file or folder, checked by walking up the target's parents. A shortcut given as the reference itself is always followed.
+  - S3 and Azure: an object must be the referenced key or lie under the referenced prefix, in the same bucket or container.
+  - Pre-signed URLs: only the referenced URLs.
+  - Paths with `.` or `..` segments are refused in references and skipped in listings. httpx resolves them, so `shared/../admin/secret.pdf`, listed under `shared/`, would otherwise download `admin/secret.pdf`.
+
+  This guards against plugin bugs, hostile content in the storage and malformed references. The token itself stays as broad as the provider issued it.
 - **No collisions.** Source names are unique per provider, item and owner, so two `report.pdf` files in different folders, or the same file ingested by two users, never overwrite each other in the Cat storage.
 - **Chat scope.** If the request carries `X-Chat-ID`, the content goes to that chat's memory, and the same visibility rules apply.
 
@@ -103,7 +110,7 @@ Response (`202`):
 { "job_id": "9f1c...", "provider": "google_drive", "references": 2, "visibility": "owner", "scope": "agent", "info": "..." }
 ```
 
-Invalid or expired credentials, malformed references and URLs outside the allowed hosts are rejected with `400` before the job starts. The job outcome is logged with its `job_id`: discovered, unchanged, unsupported, over limit, downloaded, ingested and failed counts, plus `truncated` when a limit stopped the enumeration and `aborted` with the reason when the job stopped early (for example, an expired credential). The Cat's standard ingestion hooks and webhooks keep working, because files go through the regular ingestion engine.
+Invalid or expired credentials, malformed references and URLs outside the allowed hosts are rejected with `400` before the job starts. The job outcome is logged with its `job_id`: discovered, unchanged, unsupported, over limit, downloaded, ingested, failed and out-of-scope counts, plus `truncated` when a limit stopped the enumeration and `aborted` with the reason when the job stopped early (for example, an expired credential). The Cat's standard ingestion hooks and webhooks keep working, because files go through the regular ingestion engine.
 
 ### `GET /custom/connectors/providers`
 
@@ -136,7 +143,7 @@ async def ingest_drive_folder(user, folder_id: str):
 - **Scopes:**
   - `drive.readonly` is a *restricted* scope: public apps need Google verification.
   - `drive.file` is not sensitive, but only covers the files the user picked, for example with Google Picker.
-- **References:** file or folder IDs, or Drive/Docs URLs. Shortcuts are followed, and shared drives are supported.
+- **References:** file or folder IDs, or Drive/Docs URLs. Shortcuts are followed only when their target lies inside the references (see [Security model](#security-model)), and shared drives are supported.
 - **Native Google files** are exported to a format the Cat can parse, falling back to the next one if an export fails:
   - Docs: Markdown, then PDF, then plain text.
   - Sheets: CSV, then PDF. CSV exports only the first sheet.
@@ -149,7 +156,7 @@ async def ingest_drive_folder(user, folder_id: str):
 
 ## Pre-signed URLs
 
-- **References:** one read-only, short-lived URL per object: an S3 pre-signed GET URL or an Azure blob URL with a SAS token. The credential is an empty object (`{}`).
+- **References:** one read-only, short-lived URL per object: an S3 pre-signed GET URL or an Azure blob URL with a SAS token. The credential is an empty object (`{}`). URLs with `.` or `..` path segments are refused.
 - **Hosts:** by default only `amazonaws.com` and the Azure Blob domains (`blob.core.windows.net`, `blob.core.usgovcloudapi.net`, `blob.core.chinacloudapi.cn`) are accepted; extend `allowed_url_hosts` for other storages.
 - **Change detection:** there is no way to check a pre-signed URL without downloading it (a HEAD request does not match a GET signature). The file is downloaded on every run, but it is re-ingested only if its ETag, or its SHA-256 when the ETag is missing, has changed.
 - **Errors:** an expired or rejected signature fails only that object.
@@ -179,6 +186,7 @@ url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": k
   - `s3://bucket/key` ingests one object;
   - `s3://bucket/prefix/` ingests a folder;
   - `s3://bucket/prefix` without the trailing slash is tried as an object first, then as a folder. It never matches `prefix-other`.
+  - keys with `.` or `..` segments are refused as references and skipped in listings.
 - **Requests** are signed with SigV4 by the plugin (verified against botocore), with no boto dependency. Buckets with dots in the name use path-style addressing.
 - **Change detection:** ETag.
 - **Limits:** the listing does not report content types, so objects are filtered by extension, and objects without a recognizable extension are skipped. A bucket in a different region than `region` is reported as an error.
@@ -203,7 +211,8 @@ url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": k
 - **References:**
   - `container/blob` ingests one blob;
   - `container/prefix/` ingests a folder;
-  - a blob URL of the same account is also accepted, without the SAS: the token goes only in the credential.
+  - a blob URL of the same account is also accepted, without the SAS: the token goes only in the credential;
+  - blob names with `.` or `..` segments are refused as references and skipped in listings.
 - **Skipped entries:** hierarchical-namespace directories, folder placeholders and empty blobs.
 - **Change detection:** ETag.
 - **Errors:** authentication and authorization errors stop the job, missing containers or blobs fail only that reference, and `ServerBusy` is retried.
@@ -236,7 +245,7 @@ sas = generate_container_sas(account, container, user_delegation_key=key,
 | `azure_client_id`        | empty   | Entra ID app that issued the refresh tokens                          |
 | `azure_client_secret`    | empty   | Secret of the same Entra ID app                                      |
 
-The only secrets are `google_oauth_client_secret` and `azure_client_secret`. The core masks them towards users without write permission on the plugin settings, but stores them in plain text. Leave the OAuth settings empty if the backend does the refreshing.
+The only secrets are `google_oauth_client_secret` and `azure_client_secret`. The core stores plugin settings as they are, so the plugin encrypts these two itself (`save_settings`/`load_settings` hooks in `settings.py`). It uses the core `StringCrypto`, whose key comes from `CAT_CRYPTO_KEY` and `CAT_CRYPTO_SALT`: Redis holds only the ciphertext, and the settings API and the plugin see the plaintext. The core also masks them towards users without write permission on the plugin settings. If a secret can no longer be decrypted (for example, `CAT_CRYPTO_KEY` changed), it is logged and ignored until it is saved again, and the other settings keep working. Leave the OAuth settings empty if the backend does the refreshing.
 
 ## Adding a provider
 
@@ -245,7 +254,7 @@ The plugin is organized in layers:
 ```
 connectors/
   base.py          SourceCredential, SourceItem, DownloadResult, SourceConnector, HttpSourceConnector,
-                   errors, URL allowlist, log redaction
+                   errors, URL allowlist, scope helpers, token refresh, log redaction
   google_drive.py  GoogleDriveConnector
   s3.py            S3Connector
   aws_sigv4.py     SigV4 request signing
@@ -258,7 +267,7 @@ ingestion/
   config.py        settings model, OAuth clients for token refresh
 endpoints.py       REST API
 access_control.py  recall-time visibility filter
-settings.py        settings hooks
+settings.py        settings hooks, encryption of the secrets at rest
 ```
 
 A new provider only touches `connectors/`:
@@ -270,13 +279,14 @@ A new provider only touches `connectors/`:
    - a `version` that changes with the content;
    - a `mime_type` resolved with `resolve_mime_type`.
 
-   If the version or the type is known only after the download, return it in `DownloadResult.version` or set `mime_type_known=False`.
-4. **Download.** Implement `download(item, destination)`. HTTP-based providers can extend `HttpSourceConnector`, which provides:
+   If the version or the type is known only after the download, return it in `DownloadResult.version` or set `mime_type_known=False`. Never list containers outside the references.
+4. **Scope.** Implement `in_scope(item)`: whether the item belongs to one of the job references (`self._references`, passed to the constructor). The pipeline calls it before every download, so it must fail closed. For flat namespaces, `within_prefix` and `has_dot_segments` do the work.
+5. **Download.** Implement `download(item, destination)`. HTTP-based providers can extend `HttpSourceConnector`, which provides:
    - `_auth_headers` and `_auth_params` for header or query authentication;
    - `_get`, `_get_json` and `_stream_to`, with retries, size limits, RFC 3986 query encoding and no redirects;
    - `_raise_for_status`, to override so that provider errors map to `CredentialError` (stops the job), `TokenRejectedError` (an expired or revoked token: refreshed once if possible), `ItemNotFoundError` or `UnsupportedItemError` (skips one item) and `RetryableError`.
-5. **Registration.** Add the class to `registry.py`.
-6. **Refresh (optional).** If the credential can be renewed, override its `refreshable` property and implement `_obtain_refreshed_credential`, which returns the renewed credential. For OAuth providers, `_refresh_token_grant` performs the refresh_token grant, and its result's `credential_update` gives the fields to copy onto the credential. The OAuth client comes from `options.oauth_clients[provider]`, which is filled from the settings in `ingestion/config.py`: this is the only step outside `connectors/`. The endpoint already rejects a refreshable credential whose OAuth client is not configured (`validate_refresh`).
+6. **Registration.** Add the class to `registry.py`.
+7. **Refresh (optional).** If the credential can be renewed, override its `refreshable` property and implement `_obtain_refreshed_credential`, which returns the renewed credential. For OAuth providers, `_refresh_token_grant` performs the refresh_token grant, and its result's `credential_update` gives the fields to copy onto the credential. The OAuth client comes from `options.oauth_clients[provider]`, which is filled from the settings in `ingestion/config.py`: this is the only step outside `connectors/`. The endpoint already rejects a refreshable credential whose OAuth client is not configured (`validate_refresh`).
 
 Pipeline, metadata, visibility and endpoints need no changes.
 
