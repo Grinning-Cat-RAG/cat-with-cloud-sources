@@ -1,6 +1,6 @@
 {
     "name": "Cat with Cloud Sources",
-    "version": "0.2.0",
+    "version": "0.1.0",
     "description": "Ingest files from Google Drive, Amazon S3, Azure Blob Storage or pre-signed URLs, using short-lived credentials passed by the backend, with per-user visibility on recall.",
     "author_name": "Matteo Cacciola",
     "author_url": "https://github.com/matteocacciola",

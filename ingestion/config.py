@@ -1,9 +1,17 @@
-"""Plugin configuration model. No secrets here: credentials are per request and ephemeral."""
+"""Plugin configuration model.
+
+User credentials are per request and ephemeral. The only secrets here are the optional
+OAuth client secrets, used to refresh Google Drive and Azure (Entra ID) access tokens:
+their keys end with ``_secret``, so the core masks them towards readers without write
+permission.
+"""
 from __future__ import annotations
 
 from typing import Any, Dict, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
+
+from ..connectors.base import OAuthClient
 
 Visibility = Literal["owner", "agent"]
 
@@ -28,7 +36,7 @@ class ConnectorsSettings(BaseModel):
     )
     default_visibility: Visibility = Field(default="owner", title="Default visibility of ingested items")
     allowed_url_hosts: str = Field(
-        default="amazonaws.com,blob.core.windows.net",
+        default="amazonaws.com,blob.core.windows.net,blob.core.usgovcloudapi.net,blob.core.chinacloudapi.cn",
         title="Allowed hosts for caller-provided URLs",
         description="Comma-separated hosts or parent domains for pre-signed URLs, custom S3 endpoints "
                     "and Azure account URLs. Anything else is refused (SSRF protection).",
@@ -42,6 +50,30 @@ class ConnectorsSettings(BaseModel):
         default=True,
         title="Allow agent-wide visibility",
         description="If disabled, every item is visible only to the user who ingested it.",
+    )
+    google_oauth_client_id: str = Field(
+        default="",
+        title="Google OAuth client ID",
+        description="Needed only to refresh Google Drive access tokens, for requests that carry a refresh_token.",
+    )
+    google_oauth_client_secret: str = Field(
+        default="",
+        title="Google OAuth client secret",
+        description="Secret of the same OAuth client that issued the refresh tokens.",
+    )
+    azure_tenant_id: str = Field(
+        default="",
+        # a hostname-like value or a GUID: it becomes part of the Entra ID token URL
+        pattern=r"^$|^[A-Za-z0-9][A-Za-z0-9-]{0,62}(\.[A-Za-z0-9][A-Za-z0-9-]{0,62})*$",
+        title="Azure tenant (Entra ID)",
+        description="Tenant ID or domain of the Entra ID app, e.g. contoso.onmicrosoft.com. "
+                    "Needed only to refresh Azure bearer tokens, for requests that carry a refresh_token.",
+    )
+    azure_client_id: str = Field(default="", title="Azure client ID (Entra ID app)")
+    azure_client_secret: str = Field(
+        default="",
+        title="Azure client secret (Entra ID app)",
+        description="Secret of the same Entra ID app that issued the refresh tokens.",
     )
 
     @property
@@ -58,11 +90,22 @@ class ConnectorsSettings(BaseModel):
             h.strip().lower().lstrip(".") for h in self.allowed_url_hosts.split(",") if h.strip()
         )
 
+    @property
+    def oauth_clients(self) -> Dict[str, OAuthClient]:
+        """OAuth clients by provider key; a client is configured only when all its values are set."""
+        clients: Dict[str, OAuthClient] = {}
+        google_id, google_secret = self.google_oauth_client_id.strip(), self.google_oauth_client_secret.strip()
+        if google_id and google_secret:
+            clients["google_drive"] = OAuthClient(google_id, SecretStr(google_secret))
+        azure_tenant, azure_id = self.azure_tenant_id.strip(), self.azure_client_id.strip()
+        azure_secret = self.azure_client_secret.strip()
+        if azure_tenant and azure_id and azure_secret:
+            clients["azure_blob"] = OAuthClient(azure_id, SecretStr(azure_secret), tenant_id=azure_tenant)
+        return clients
+
     @classmethod
     def from_raw(cls, raw: Dict[str, Any] | None) -> "ConnectorsSettings":
-        """Tolerant loader: unknown keys (e.g. legacy settings) are ignored."""
-        known = {k: v for k, v in (raw or {}).items() if k in cls.model_fields}
-        return cls.model_validate(known)
+        return cls.model_validate(raw or {})
 
 
 async def load_connectors_settings(plugin, agent_id: str) -> ConnectorsSettings:

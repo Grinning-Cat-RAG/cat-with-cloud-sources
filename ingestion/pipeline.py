@@ -50,6 +50,7 @@ def build_connector_options(settings: ConnectorsSettings, accepted_mime_types) -
         accepted_mime_types=frozenset(accepted_mime_types),
         allowed_host_suffixes=settings.allowed_host_suffixes,
         allow_http=settings.allow_http_urls,
+        oauth_clients=settings.oauth_clients,
     )
 
 

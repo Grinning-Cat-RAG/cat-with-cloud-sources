@@ -5,21 +5,21 @@ Ingest documents from external storages into the Grinning Cat memory, using **sh
 | Provider key    | Source                                  | Credential passed to the Cat                     |
 |-----------------|-----------------------------------------|--------------------------------------------------|
 | `presigned_url` | Any object behind a pre-signed/SAS URL  | None: the signature is inside each URL           |
-| `google_drive`  | Google Drive (My Drive, shared drives)  | User OAuth access token                          |
+| `google_drive`  | Google Drive (My Drive, shared drives)  | User OAuth access token, optionally its refresh token |
 | `s3`            | Amazon S3 and S3-compatible storages    | Temporary STS credentials                        |
-| `azure_blob`    | Azure Blob Storage                      | Container SAS token or Entra ID bearer token     |
+| `azure_blob`    | Azure Blob Storage                      | Container SAS token, or Entra ID bearer token optionally with its refresh token |
 
 Prefer `presigned_url` whenever the backend already knows which objects to ingest: no credential reaches the Cat at all. Use the other providers when the Cat must list folders, buckets or containers.
 
-The Grinning Cat is meant to run as a microservice reachable only by your backend. The backend authenticates the user, keeps the long-lived secrets (refresh tokens, cloud keys) and hands the Cat only an access token that expires soon. The plugin never stores it.
+The Grinning Cat is meant to run as a microservice reachable only by your backend. The backend authenticates the user, keeps the long-lived secrets (cloud keys and, by default, refresh tokens) and hands the Cat only an access token that expires soon. For Google Drive and the Azure bearer token the backend may also send the refresh token, so that the Cat renews the access token during long jobs (see [Token expiry](#token-expiry)). The plugin never stores either of them.
 
 ## How it works
 
 ```
 Frontend ──login──▶ Backend ──(API key + X-User-ID + X-Agent-ID)──▶ Grinning Cat
-                     │  keeps refresh token                         │
+                     │  keeps refresh token (or sends it: Drive, Azure bearer)
                      └─ POST /custom/connectors/ingest ─────────────┘
-                        { provider, credential: {access_token}, references }
+                        { provider, credential: {access_token, [refresh_token]}, references }
 ```
 
 Each request starts a background job with two phases:
@@ -31,7 +31,23 @@ A slow embedding phase therefore cannot outlive the token, and a failed ingestio
 
 ### Token expiry
 
-The plugin never refreshes a credential: it never receives a refresh token. Refreshing is the backend's job.
+**Automatic refresh.** If the credential carries a `refresh_token` and the agent's settings contain the OAuth client that issued it, the connector renews the access token by itself:
+
+| Provider       | Credential                           | OAuth client in the settings                                      |
+|----------------|--------------------------------------|-------------------------------------------------------------------|
+| `google_drive` | `access_token` + `refresh_token`     | `google_oauth_client_id`, `google_oauth_client_secret`            |
+| `azure_blob`   | `bearer_token` + `refresh_token`     | `azure_tenant_id`, `azure_client_id`, `azure_client_secret` (Entra ID app; scope `https://storage.azure.com/.default offline_access`) |
+
+The connector refreshes:
+
+- before a request, when `expires_at` falls within the next 30 seconds (the new `expires_at` comes from the provider's `expires_in`);
+- when the storage answers `401`: the token is refreshed once and the request is repeated. A second `401` stops the job. A `403` never triggers a refresh, because it means a missing scope or permission.
+
+Not refreshable, because there is no refresh token to exchange: S3 STS credentials (new ones need a fresh `AssumeRole` with long-lived AWS keys) and Azure SAS tokens (a new SAS needs the account key or a user delegation key). A `refresh_token` sent with a `sas_token` is rejected with `400`. `presigned_url` has no credential at all.
+
+With a `refresh_token`, even an already expired access token is accepted. Without the OAuth client in the settings, the request is rejected with `400`. If the identity provider refuses the refresh (for example `invalid_grant`, when the user revoked the access), the job stops. Only the OAuth error code is reported, never the tokens. If the provider rotates the refresh token (Entra ID always does), the new one is used for the rest of the job. The refreshed tokens live only in memory and are dropped with the connector at the end of phase 1: send the refresh token again with every request.
+
+**Without automatic refresh** (S3, Azure SAS, or a credential without `refresh_token`) the backend is in charge of refreshing:
 
 - **Before the job.** A credential whose `expires_at` falls within the next 30 seconds is rejected with `400`.
 - **During phase 1.** `expires_at` is checked again before every request, retries included. If the provider answers that the credential is invalid or expired, the job stops in the same way.
@@ -42,11 +58,11 @@ The plugin never refreshes a credential: it never receives a refresh token. Refr
 
 `expires_at` is optional. Without it, the plugin only notices an expired token when the provider rejects it. Always send it when you know it.
 
-If phase 1 may outlast the token (large folders, big files), refresh the token right before calling the Cat. If a job is aborted, send the same request again with a new token: items already ingested at the same version are skipped as unchanged.
+If phase 1 may outlast the token (large folders, big files), refresh the token right before calling the Cat, or send the refresh token (Drive, Azure bearer). If a job is aborted, send the same request again with a new token: items already ingested at the same version are skipped as unchanged.
 
 ## Security model
 
-- **Credentials are ephemeral.** They exist in memory only for the duration of phase 1. They are never written to settings, logs, metadata, prompts or responses. Secrets are `SecretStr`, and validation errors never echo the input (the request body is validated manually for this reason).
+- **Credentials are ephemeral.** They exist in memory only for the duration of phase 1, refresh tokens and refreshed access tokens included. They are never written to settings, logs, metadata, prompts or responses. Secrets are `SecretStr`, and validation errors never echo the input (the request body is validated manually for this reason).
 - **Visibility is enforced on recall.** Every chunk carries `connector_owner` and `connector_visibility`:
   - `owner` (the default): only the user who ingested the item can recall it.
   - `agent`: every user of the agent can recall it. This can be disabled per agent.
@@ -78,6 +94,8 @@ Headers: `X-Agent-ID` is required. `X-Chat-ID` is optional and enables chat scop
   "metadata": { "team": "sales" }
 }
 ```
+
+For automatic refresh, add `"refresh_token": "..."` to a Google Drive credential or to an Azure credential with `bearer_token` (see [Token expiry](#token-expiry)).
 
 Response (`202`):
 
@@ -114,7 +132,7 @@ async def ingest_drive_folder(user, folder_id: str):
 
 ## Google Drive
 
-- **Token:** a user OAuth access token, obtained by the backend with the Authorization Code flow. The refresh token stays on the backend.
+- **Token:** a user OAuth access token, obtained by the backend with the Authorization Code flow. The refresh token stays on the backend, unless you send it as `refresh_token` to enable [automatic refresh](#token-expiry). That also requires `google_oauth_client_id` and `google_oauth_client_secret` in the settings.
 - **Scopes:**
   - `drive.readonly` is a *restricted* scope: public apps need Google verification.
   - `drive.file` is not sensitive, but only covers the files the user picked, for example with Google Picker.
@@ -132,7 +150,7 @@ async def ingest_drive_folder(user, folder_id: str):
 ## Pre-signed URLs
 
 - **References:** one read-only, short-lived URL per object: an S3 pre-signed GET URL or an Azure blob URL with a SAS token. The credential is an empty object (`{}`).
-- **Hosts:** by default only `amazonaws.com` and `blob.core.windows.net` are accepted; extend `allowed_url_hosts` for other storages.
+- **Hosts:** by default only `amazonaws.com` and the Azure Blob domains (`blob.core.windows.net`, `blob.core.usgovcloudapi.net`, `blob.core.chinacloudapi.cn`) are accepted; extend `allowed_url_hosts` for other storages.
 - **Change detection:** there is no way to check a pre-signed URL without downloading it (a HEAD request does not match a GET signature). The file is downloaded on every run, but it is re-ingested only if its ETag, or its SHA-256 when the ETag is missing, has changed.
 - **Errors:** an expired or rejected signature fails only that object.
 
@@ -171,9 +189,17 @@ url = s3.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": k
 
 ## Azure Blob Storage
 
-- **Credential:** `account_url` (for example `https://acct.blob.core.windows.net`, which must be in `allowed_url_hosts`) plus exactly one of:
+- **Credential:** `account_url` (for example `https://acct.blob.core.windows.net`, which must be in `allowed_url_hosts`: the default accepts the public, US Government and China clouds) plus exactly one of:
   - `sas_token`: a container or directory SAS with permissions `rl` and a short expiry;
-  - `bearer_token`: an Entra ID token for `https://storage.azure.com/.default`, with the *Storage Blob Data Reader* role.
+  - `bearer_token`: an Entra ID token for `https://storage.azure.com/.default`, with the *Storage Blob Data Reader* role. It may come with its `refresh_token` for [automatic refresh](#token-expiry), which also requires `azure_tenant_id`, `azure_client_id` and `azure_client_secret` in the settings. The Entra ID authority follows the cloud of `account_url`:
+
+  | `account_url` host             | Cloud            | Entra ID authority          |
+  |--------------------------------|------------------|-----------------------------|
+  | `*.blob.core.windows.net`      | Public           | `login.microsoftonline.com` |
+  | `*.blob.core.usgovcloudapi.net`| US Government    | `login.microsoftonline.us`  |
+  | `*.blob.core.chinacloudapi.cn` | China (21Vianet) | `login.chinacloudapi.cn`    |
+
+  The Entra ID app in the settings must be registered in the same cloud as the account. With any other host (for example a custom domain) a request with `refresh_token` is rejected with `400`, so the client secret is never sent to a guessed authority. Without `refresh_token`, custom domains keep working.
 - **References:**
   - `container/blob` ingests one blob;
   - `container/prefix/` ingests a folder;
@@ -202,10 +228,15 @@ sas = generate_container_sas(account, container, user_delegation_key=key,
 | `enforce_owner_acl`      | true    | Apply the visibility filter on recall                                |
 | `default_visibility`     | owner   | Used when the request does not specify it                            |
 | `allow_agent_visibility` | true    | If false, requests with `visibility: agent` are refused (403)        |
-| `allowed_url_hosts`      | `amazonaws.com,blob.core.windows.net` | Hosts or parent domains accepted in caller-provided URLs |
+| `allowed_url_hosts`      | `amazonaws.com,blob.core.windows.net,blob.core.usgovcloudapi.net,blob.core.chinacloudapi.cn` | Hosts or parent domains accepted in caller-provided URLs |
 | `allow_http_urls`        | false   | Allow plain HTTP, only for local emulators (MinIO, Azurite)          |
+| `google_oauth_client_id` | empty   | Google OAuth client, needed only to refresh Drive tokens             |
+| `google_oauth_client_secret` | empty | Secret of the same OAuth client                                   |
+| `azure_tenant_id`        | empty   | Entra ID tenant (ID or domain), needed only to refresh Azure bearer tokens |
+| `azure_client_id`        | empty   | Entra ID app that issued the refresh tokens                          |
+| `azure_client_secret`    | empty   | Secret of the same Entra ID app                                      |
 
-No setting contains secrets.
+The only secrets are `google_oauth_client_secret` and `azure_client_secret`. The core masks them towards users without write permission on the plugin settings, but stores them in plain text. Leave the OAuth settings empty if the backend does the refreshing.
 
 ## Adding a provider
 
@@ -224,7 +255,7 @@ connectors/
 ingestion/
   pipeline.py      two-phase job, incremental updates, limits (provider-agnostic)
   metadata.py      metadata keys, source naming, visibility rule
-  config.py        settings model
+  config.py        settings model, OAuth clients for token refresh
 endpoints.py       REST API
 access_control.py  recall-time visibility filter
 settings.py        settings hooks
@@ -243,17 +274,19 @@ A new provider only touches `connectors/`:
 4. **Download.** Implement `download(item, destination)`. HTTP-based providers can extend `HttpSourceConnector`, which provides:
    - `_auth_headers` and `_auth_params` for header or query authentication;
    - `_get`, `_get_json` and `_stream_to`, with retries, size limits, RFC 3986 query encoding and no redirects;
-   - `_raise_for_status`, to override so that provider errors map to `CredentialError` (stops the job), `ItemNotFoundError` or `UnsupportedItemError` (skips one item) and `RetryableError`.
+   - `_raise_for_status`, to override so that provider errors map to `CredentialError` (stops the job), `TokenRejectedError` (an expired or revoked token: refreshed once if possible), `ItemNotFoundError` or `UnsupportedItemError` (skips one item) and `RetryableError`.
 5. **Registration.** Add the class to `registry.py`.
+6. **Refresh (optional).** If the credential can be renewed, override its `refreshable` property and implement `_obtain_refreshed_credential`, which returns the renewed credential. For OAuth providers, `_refresh_token_grant` performs the refresh_token grant, and its result's `credential_update` gives the fields to copy onto the credential. The OAuth client comes from `options.oauth_clients[provider]`, which is filled from the settings in `ingestion/config.py`: this is the only step outside `connectors/`. The endpoint already rejects a refreshable credential whose OAuth client is not configured (`validate_refresh`).
 
 Pipeline, metadata, visibility and endpoints need no changes.
 
-## Migrating from 0.1.x
+## Tests
 
-- The service account mode and its `service_account_json` setting are gone. The core settings migration keeps only the keys of the new model, so the stored service account should be dropped; check it anyway and remove the service account key from Google Cloud if it is no longer used.
-- `POST /drive/ingest` is replaced by `POST /custom/connectors/ingest`.
-- `google-api-python-client` is no longer needed: the plugin uses the Drive REST API through `httpx`, which the core already provides.
-- Chunks ingested by 0.1.x carry `google_drive_id` instead of the `connector_*` keys. The visibility filter treats them as regular documents, visible to everyone. Delete them and re-ingest them if they must become private.
+The connector tests need only the plugin dependencies (no running Cat). From the plugin folder:
+
+```bash
+python -m unittest discover -s tests
+```
 
 ## Limitations
 

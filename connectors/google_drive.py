@@ -1,8 +1,10 @@
 """Google Drive connector, authenticated with a user's OAuth access token.
 
-The backend obtains the token (Authorization Code flow, refresh token kept on the
-backend) and passes only the short-lived access token. Required scopes:
-``drive.readonly`` (restricted) or ``drive.file`` (only files picked by the user).
+The backend obtains the token (Authorization Code flow) and passes the short-lived
+access token. It may also pass the refresh token: the connector then renews the
+access token when it is about to expire or when Drive answers 401, using the OAuth
+client configured in the plugin settings. Required scopes: ``drive.readonly``
+(restricted) or ``drive.file`` (only files picked by the user).
 
 It talks to the Drive REST API v3 directly with httpx: fully async, streaming,
 no blocking client library.
@@ -29,6 +31,7 @@ from .base import (
 )
 
 API_BASE = "https://www.googleapis.com/drive/v3"
+TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
 SHORTCUT_MIME = "application/vnd.google-apps.shortcut"
@@ -53,6 +56,12 @@ _RATE_LIMIT_403 = {"rateLimitExceeded", "userRateLimitExceeded", "sharingRateLim
 
 class GoogleDriveCredential(SourceCredential):
     access_token: SecretStr
+    #: optional: lets the connector renew the access token (needs the OAuth client in the settings)
+    refresh_token: SecretStr | None = None
+
+    @property
+    def refreshable(self) -> bool:
+        return self.refresh_token is not None
 
 
 class GoogleDriveConnector(HttpSourceConnector[GoogleDriveCredential]):
@@ -73,6 +82,14 @@ class GoogleDriveConnector(HttpSourceConnector[GoogleDriveCredential]):
     # -- credential / errors ---------------------------------------------------
     # Drive answers downloads with redirects to googleusercontent.com
     FOLLOW_REDIRECTS: ClassVar[bool] = True
+
+    async def _obtain_refreshed_credential(self) -> GoogleDriveCredential:
+        credential = self._credential
+        client = self.options.oauth_clients.get(self.provider)
+        if client is None or credential.refresh_token is None:
+            raise CredentialError("The Google Drive credential cannot be refreshed")
+        token = await self._refresh_token_grant(TOKEN_URL, credential.refresh_token, client)
+        return credential.model_copy(update=token.credential_update("access_token"))
 
     def _auth_headers(self, method: str, url: str, params: Dict[str, Any]) -> Dict[str, str]:
         return {"Authorization": f"Bearer {self._credential.access_token.get_secret_value()}"}

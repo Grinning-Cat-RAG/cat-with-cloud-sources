@@ -2,8 +2,10 @@
 
 A *source connector* knows how to enumerate and download items from an external
 storage (Google Drive, S3, Azure Blob, ...) using a short-lived credential that
-belongs to the end user. It knows nothing about the Grinning Cat: ingestion,
-metadata and access control live in the ``ingestion`` package.
+belongs to the end user. A credential may also be *refreshable* (e.g. an OAuth
+access token sent with its refresh token): the connector then renews it when it
+is about to expire or when the provider answers 401. It knows nothing about the
+Grinning Cat: ingestion, metadata and access control live in the ``ingestion`` package.
 
 Layers:
 
@@ -17,7 +19,8 @@ Layers:
 Security contract for every implementation:
 - never log, persist or return the credential;
 - never put the credential into item metadata;
-- raise ``CredentialError`` on 401/403 so the job can stop early.
+- raise ``CredentialError`` on 401/403 so the job can stop early (``TokenRejectedError``
+  on 401, which triggers one refresh when the credential is refreshable).
 """
 from __future__ import annotations
 
@@ -26,7 +29,9 @@ import hashlib
 import ipaddress
 import logging
 import mimetypes
+import math
 import random
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -34,7 +39,7 @@ from typing import Any, AsyncIterator, BinaryIO, ClassVar, Dict, Generic, Iterab
 from urllib.parse import quote, urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, SecretStr, ValidationError
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +89,10 @@ class CredentialError(ConnectorError):
     """The credential is invalid, expired or lacks the required scope. Fatal for the job."""
 
 
+class TokenRejectedError(CredentialError):
+    """The provider rejected the token (HTTP 401): refreshing the credential may help."""
+
+
 class ItemNotFoundError(ConnectorError):
     """The referenced item does not exist or is not visible with this credential."""
 
@@ -117,6 +126,11 @@ class SourceCredential(BaseModel):
         if expires_at.tzinfo is None:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         return datetime.now(timezone.utc) + margin >= expires_at
+
+    @property
+    def refreshable(self) -> bool:
+        """True when the connector can renew the credential by itself."""
+        return False
 
 
 CredentialT = TypeVar("CredentialT", bound=SourceCredential)
@@ -160,6 +174,39 @@ class DownloadResult:
 
 
 @dataclass(frozen=True)
+class OAuthClient:
+    """OAuth client of the Cat, used to refresh user access tokens."""
+
+    client_id: str
+    client_secret: SecretStr
+    #: directory tenant, for identity providers that need it in the token URL (Entra ID)
+    tenant_id: str = ""
+
+
+_OAUTH_ERROR_RE = re.compile(r"^[a-z_]{1,64}$")
+#: access tokens last about an hour: anything beyond a day is not a real lifetime
+_MAX_TOKEN_LIFETIME_SECONDS = 24 * 3600
+
+
+@dataclass(frozen=True)
+class RefreshedToken:
+    """Outcome of an OAuth refresh_token grant."""
+
+    access_token: SecretStr
+    #: None when the provider did not report a usable lifetime
+    expires_at: datetime | None
+    #: set only when the provider rotated the refresh token
+    refresh_token: SecretStr | None = None
+
+    def credential_update(self, token_field: str) -> Dict[str, Any]:
+        """Fields to apply with ``model_copy(update=...)`` on the stale credential."""
+        update: Dict[str, Any] = {token_field: self.access_token, "expires_at": self.expires_at}
+        if self.refresh_token is not None:
+            update["refresh_token"] = self.refresh_token
+        return update
+
+
+@dataclass(frozen=True)
 class ConnectorOptions:
     """Provider-neutral knobs passed by the ingestion layer.
 
@@ -175,6 +222,8 @@ class ConnectorOptions:
     #: hosts (or parent domains) that caller-provided URLs may point to
     allowed_host_suffixes: frozenset[str] = frozenset()
     allow_http: bool = False
+    #: OAuth clients by provider key, used to refresh refreshable credentials
+    oauth_clients: Mapping[str, OAuthClient] = field(default_factory=dict)
 
 
 def resolve_mime_type(declared: str | None, name: str, accepted: Iterable[str]) -> str:
@@ -208,6 +257,7 @@ class SourceConnector(ABC, Generic[CredentialT]):
     def __init__(self, credential: CredentialT, options: ConnectorOptions):
         self._credential = credential
         self.options = options
+        self._refresh_lock = asyncio.Lock()
 
     @classmethod
     def parse_credential(cls, raw: Dict[str, Any]) -> CredentialT:
@@ -220,9 +270,17 @@ class SourceConnector(ABC, Generic[CredentialT]):
                 f"{'.'.join(str(p) for p in err['loc']) or 'credential'}: {err['msg']}" for err in e.errors()
             })
             raise CredentialError(f"Invalid credential for '{cls.provider}': {'; '.join(problems)}") from None
-        if credential.is_expired():
+        if credential.is_expired() and not credential.refreshable:
             raise CredentialError(f"The credential for '{cls.provider}' is expired")
         return credential  # type: ignore[return-value]
+
+    @classmethod
+    def validate_refresh(cls, credential: SourceCredential, options: "ConnectorOptions") -> None:
+        """A refreshable credential needs the provider's OAuth client in the settings."""
+        if credential.refreshable and cls.provider not in options.oauth_clients:
+            raise ConnectorError(
+                f"A refresh_token for '{cls.provider}' requires its OAuth client in the plugin settings"
+            )
 
     @classmethod
     def validate_request(
@@ -255,9 +313,24 @@ class SourceConnector(ABC, Generic[CredentialT]):
         if not any(host == suffix or host.endswith(f".{suffix}") for suffix in options.allowed_host_suffixes):
             raise ConnectorError(f"The host of the {what} is not allowed: {host}")
 
-    def ensure_credential_valid(self) -> None:
-        if self._credential.is_expired():
+    async def ensure_fresh_credential(self) -> None:
+        """Refresh the credential if it is about to expire; fail if it cannot be refreshed."""
+        credential = self._credential
+        if not credential.is_expired():
+            return
+        if not credential.refreshable:
             raise CredentialError(f"The credential for '{self.provider}' expired during the job")
+        await self.refresh_credential(credential)
+
+    async def refresh_credential(self, stale: SourceCredential) -> None:
+        """Replace ``stale`` with a fresh credential, unless another request already did."""
+        async with self._refresh_lock:
+            if self._credential is stale:
+                self._credential = await self._obtain_refreshed_credential()
+
+    async def _obtain_refreshed_credential(self) -> CredentialT:
+        """Return a renewed credential. Override in providers with refreshable credentials."""
+        raise CredentialError(f"The credential for '{self.provider}' cannot be refreshed")
 
     async def __aenter__(self):
         await self.open()
@@ -345,7 +418,9 @@ class HttpSourceConnector(SourceConnector[CredentialT], ABC):
         status = response.status_code
         if status in self.RETRYABLE_STATUSES:
             raise RetryableError(f"HTTP {status} while {what}")
-        if status in (401, 403):
+        if status == 401:
+            raise TokenRejectedError(f"Access denied ({status}) while {what}")
+        if status == 403:
             raise CredentialError(f"Access denied ({status}) while {what}")
         if status == 404:
             raise ItemNotFoundError(f"Not found while {what}")
@@ -353,20 +428,89 @@ class HttpSourceConnector(SourceConnector[CredentialT], ABC):
             raise ConnectorError(f"Unexpected redirect ({status}) while {what}")
         raise ConnectorError(f"HTTP {status} while {what}")
 
-    async def _with_retries(self, operation, what: str):
+    async def _with_retries(self, operation, what: str, authenticated: bool = True):
+        """Run ``operation`` retrying transient failures.
+
+        When ``authenticated``, the credential is refreshed before an attempt if it is
+        about to expire, and once more if the provider rejects the token (401).
+        """
         attempts = max(1, self.options.max_retries + 1)
-        for attempt in range(attempts):
-            self.ensure_credential_valid()
+        attempt = 0
+        refreshed_after_rejection = False
+        while True:
+            if authenticated:
+                await self.ensure_fresh_credential()
+            used = self._credential
             try:
                 return await operation()
+            except TokenRejectedError:
+                if not authenticated or refreshed_after_rejection or not used.refreshable:
+                    raise
+                refreshed_after_rejection = True
+                await self.refresh_credential(used)
+                continue
             except httpx.HTTPError as e:
                 error: ConnectorError = RetryableError(f"Network error while {what}: {type(e).__name__}")
             except RetryableError as e:
                 error = e
-            if attempt == attempts - 1:
+            attempt += 1
+            if attempt == attempts:
                 raise ConnectorError(str(error)) from None
-            await asyncio.sleep(min(2 ** attempt + random.random(), 30))
-        raise ConnectorError(f"Unreachable while {what}")  # pragma: no cover
+            await asyncio.sleep(min(2 ** (attempt - 1) + random.random(), 30))
+
+    async def _refresh_token_grant(
+        self, token_url: str, refresh_token: SecretStr, client: OAuthClient, extra: Mapping[str, str] | None = None
+    ) -> RefreshedToken:
+        """OAuth 2.0 refresh_token grant against ``token_url`` (a fixed provider URL, never caller-provided)."""
+        what = f"refreshing the {self.display_name} access token"
+        form = {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token.get_secret_value(),
+            "client_id": client.client_id,
+            "client_secret": client.client_secret.get_secret_value(),
+            **(extra or {}),
+        }
+
+        async def operation():
+            response = await self.client.post(token_url, data=form, follow_redirects=False)
+            if response.status_code in self.RETRYABLE_STATUSES:
+                raise RetryableError(f"HTTP {response.status_code} while {what}")
+            if not response.is_success:
+                raise CredentialError(
+                    f"{self.display_name} refused to refresh the access token ({self._oauth_error(response)})"
+                )
+            try:
+                return response.json()
+            except ValueError:
+                raise CredentialError(f"Invalid response while {what}") from None
+
+        token = await self._with_retries(operation, what, authenticated=False)
+        access_token = token.get("access_token") if isinstance(token, dict) else None
+        if not isinstance(access_token, str) or not access_token:
+            raise CredentialError(f"No access token in the response while {what}")
+        expires_in = token.get("expires_in")
+        valid_lifetime = (
+            isinstance(expires_in, (int, float))
+            and not isinstance(expires_in, bool)
+            and math.isfinite(expires_in)
+            and 0 < expires_in <= _MAX_TOKEN_LIFETIME_SECONDS
+        )
+        rotated = token.get("refresh_token")
+        return RefreshedToken(
+            access_token=SecretStr(access_token),
+            # unknown lifetime: no proactive refresh, a 401 still triggers one
+            expires_at=datetime.now(timezone.utc) + timedelta(seconds=expires_in) if valid_lifetime else None,
+            refresh_token=SecretStr(rotated) if isinstance(rotated, str) and rotated else None,
+        )
+
+    @staticmethod
+    def _oauth_error(response: httpx.Response) -> str:
+        """The OAuth error code (e.g. ``invalid_grant``), never the description."""
+        try:
+            code = response.json().get("error")
+        except (ValueError, AttributeError):
+            code = None
+        return code if isinstance(code, str) and _OAUTH_ERROR_RE.match(code) else f"HTTP {response.status_code}"
 
     @staticmethod
     def encode_query(params: Mapping[str, str]) -> str:

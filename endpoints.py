@@ -27,7 +27,9 @@ class ConnectorIngestRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     provider: str = Field(description="Connector key, see GET /custom/connectors/providers")
-    credential: Dict[str, Any] = Field(repr=False, description="Short-lived, provider-specific credential")
+    credential: Dict[str, Any] = Field(
+        repr=False, description="Provider-specific credential: short-lived, optionally with a refresh token"
+    )
     references: List[str] = Field(min_length=1, max_length=100, description="Items to ingest (IDs, URLs, prefixes...)")
     recursive: bool = True
     visibility: Literal["owner", "agent"] | None = Field(
@@ -94,10 +96,10 @@ async def ingest_from_connector(
     target = info.stray_cat or ccat
     accepted_mime_types = set((await target.file_handlers()).keys())
 
+    options = build_connector_options(settings, accepted_mime_types)
     try:
-        connector_cls.validate_request(
-            credential, payload.references, build_connector_options(settings, accepted_mime_types)
-        )
+        connector_cls.validate_refresh(credential, options)
+        connector_cls.validate_request(credential, payload.references, options)
     except ConnectorError as e:
         raise CustomValidationException(str(e)) from None
 

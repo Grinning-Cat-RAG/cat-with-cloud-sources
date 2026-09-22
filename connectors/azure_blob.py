@@ -5,7 +5,12 @@ Two kinds of short-lived credential, both produced by the backend:
 - a **SAS token** scoped to the container (or a directory), permissions ``rl``
   (read + list), short expiry;
 - an **Entra ID bearer token** for ``https://storage.azure.com/.default``, with the
-  *Storage Blob Data Reader* role on the container.
+  *Storage Blob Data Reader* role on the container. It may come with its refresh
+  token: the connector then renews the bearer token when it is about to expire or
+  when Azure answers 401, using the Entra ID app configured in the plugin settings.
+  The Entra ID authority follows the cloud of ``account_url`` (public, US Government,
+  China).
+  A SAS cannot be refreshed (a new one needs the account key or a user delegation key).
 
 Talks to the Blob REST API with httpx.
 """
@@ -30,10 +35,19 @@ from .base import (
     RetryableError,
     SourceCredential,
     SourceItem,
+    TokenRejectedError,
     resolve_mime_type,
 )
 
 API_VERSION = "2023-11-03"
+ENTRA_TOKEN_URL = "https://{authority}/{tenant}/oauth2/v2.0/token"
+#: blob endpoint suffix -> Entra ID authority host, one entry per Azure cloud
+ENTRA_AUTHORITIES = {
+    "blob.core.windows.net": "login.microsoftonline.com",
+    "blob.core.usgovcloudapi.net": "login.microsoftonline.us",
+    "blob.core.chinacloudapi.cn": "login.chinacloudapi.cn",
+}
+STORAGE_SCOPE = "https://storage.azure.com/.default offline_access"
 
 _CONTAINER_RE = re.compile(r"^(?!.*--)[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$")
 
@@ -52,6 +66,8 @@ class AzureBlobCredential(SourceCredential):
     account_url: str
     sas_token: SecretStr | None = None
     bearer_token: SecretStr | None = None
+    #: optional, only with bearer_token: lets the connector renew it (needs the Entra ID app in the settings)
+    refresh_token: SecretStr | None = None
 
     @field_validator("account_url")
     @classmethod
@@ -65,7 +81,13 @@ class AzureBlobCredential(SourceCredential):
     def _one_auth(self):
         if (self.sas_token is None) == (self.bearer_token is None):
             raise ValueError("provide exactly one of sas_token or bearer_token")
+        if self.refresh_token is not None and self.bearer_token is None:
+            raise ValueError("refresh_token is supported only with bearer_token")
         return self
+
+    @property
+    def refreshable(self) -> bool:
+        return self.refresh_token is not None
 
 
 class AzureBlobConnector(HttpSourceConnector[AzureBlobCredential]):
@@ -84,8 +106,22 @@ class AzureBlobConnector(HttpSourceConnector[AzureBlobCredential]):
     ) -> None:
         account_url = credential.account_url  # type: ignore[attr-defined]
         cls.check_url(account_url, options, "Azure account URL")
+        if credential.refreshable and cls.entra_authority(account_url) is None:
+            raise ConnectorError(
+                "refresh_token needs an account in a known Azure cloud (public, US Government, China): "
+                "the Entra ID authority cannot be derived from this account URL"
+            )
         for reference in references:
             cls.parse_reference(reference, account_url)
+
+    @staticmethod
+    def entra_authority(account_url: str) -> str | None:
+        """Entra ID authority host of the cloud the account belongs to, None for unknown hosts."""
+        host = (urlsplit(account_url).hostname or "").lower().rstrip(".")
+        for suffix, authority in ENTRA_AUTHORITIES.items():
+            if host.endswith(f".{suffix}"):
+                return authority
+        return None
 
     @staticmethod
     def parse_reference(reference: str, account_url: str) -> Tuple[str, str]:
@@ -104,6 +140,20 @@ class AzureBlobConnector(HttpSourceConnector[AzureBlobCredential]):
         return container, name
 
     # -- auth / errors ---------------------------------------------------------
+    async def _obtain_refreshed_credential(self) -> AzureBlobCredential:
+        credential = self._credential
+        client = self.options.oauth_clients.get(self.provider)
+        authority = self.entra_authority(credential.account_url)
+        if client is None or not client.tenant_id or authority is None or credential.refresh_token is None:
+            raise CredentialError("The Azure credential cannot be refreshed")
+        token = await self._refresh_token_grant(
+            ENTRA_TOKEN_URL.format(authority=authority, tenant=quote(client.tenant_id, safe="")),
+            credential.refresh_token,
+            client,
+            {"scope": STORAGE_SCOPE},
+        )
+        return credential.model_copy(update=token.credential_update("bearer_token"))
+
     def _auth_headers(self, method: str, url: str, params: Dict[str, str]) -> Dict[str, str]:
         headers = {"x-ms-version": API_VERSION}
         if self._credential.bearer_token is not None:
@@ -132,7 +182,8 @@ class AzureBlobConnector(HttpSourceConnector[AzureBlobCredential]):
             return
         code = self._error_code(response)
         if code in _CREDENTIAL_CODES:
-            raise CredentialError(f"Azure rejected the credential ({code}) while {what}")
+            error = TokenRejectedError if response.status_code == 401 else CredentialError
+            raise error(f"Azure rejected the credential ({code}) while {what}")
         if code in _RETRY_CODES:
             raise RetryableError(f"Azure {code} while {what}")
         if code in _NOT_FOUND_CODES:
