@@ -4,3 +4,4 @@
 # The code runs on Linux: the CI is ubuntu-latest and the database is a
 # container.
 * text=auto eol=lf
+tests/ export-ignore
