@@ -292,10 +292,10 @@ Pipeline, metadata, visibility and endpoints need no changes.
 
 ## Tests
 
-The connector tests need only the plugin dependencies (no running Cat). From the plugin folder:
+The tests need the Cat core and the plugin dependencies (no running Cat). From the root of the Cat core:
 
 ```bash
-python -m unittest discover -s tests
+python -m unittest discover -s cat/plugins/cat-with-cloud-sources/tests
 ```
 
 ## Limitations

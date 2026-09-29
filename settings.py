@@ -37,7 +37,7 @@ def _decrypted(stored: Dict[str, Any], agent_id: str) -> Dict[str, Any]:
 async def load_settings(plugin_id: str, agent_id: str) -> Dict[str, Any]:
     stored = await crud_plugins.get_setting(agent_id, plugin_id)
     if stored is None:
-        return ConnectorsSettings().model_dump()
+        return ConnectorsSettings().model_dump(mode="json")
     return _decrypted(stored, agent_id)
 
 

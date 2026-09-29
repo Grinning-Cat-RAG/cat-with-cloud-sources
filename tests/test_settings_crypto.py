@@ -1,20 +1,20 @@
 """Encryption at rest of the plugin secrets (OAuth client secrets) in the settings stored by the core.
 
-Run from the plugin root: ``python -m unittest discover -s tests``.
+Run from the root of the Cat core: ``python -m unittest discover -s cat/plugins/cat-with-cloud-sources/tests``.
 
-The plugin modules are imported lazily in ``setUpModule``: the Cat imports every
-``.py`` file of the plugin, and at import time this module needs only the stdlib.
+The Cat imports every ``.py`` file of the plugin, tests included: at import time this module
+needs only the stdlib, the plugin is loaded in ``setUpModule`` with the loader of the Cat.
 """
 import enum
-import importlib
+import json
 import sys
-import types
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 config = settings_hooks = None
 
-PACKAGE = "cloud_sources_under_test"
+PLUGIN_PATH = str(Path(__file__).resolve().parents[1])
 PLUGIN_ID = "cat_with_cloud_sources"
 AGENT_ID = "agent"
 
@@ -55,38 +55,14 @@ STORE = FakePluginSettingsStore()
 ERRORS = []
 
 
-def _module(name):
-    if name not in sys.modules:
-        sys.modules[name] = types.ModuleType(name)
-    return sys.modules[name]
-
-
-def _stub_cat() -> None:
-    """Add what settings.py needs to the (possibly already stubbed) ``cat`` package."""
-    noop = lambda *args, **kwargs: None  # noqa: E731
-    cat = _module("cat")
-    cat.log = types.SimpleNamespace(info=noop, warning=noop, debug=noop, error=lambda msg, *a, **k: ERRORS.append(msg))
-    # like the core CatPluginDecorator: the core calls ``.function``
-    cat.plugin = lambda function: types.SimpleNamespace(function=function, name=function.__name__)
-    cruds = _module("cat.db.cruds")
-    cruds.plugins = STORE
-    _module("cat.db").cruds = cruds
-    sys.modules["cat.db.cruds.plugins"] = STORE
-    _module("cat.services.string_crypto").StringCrypto = FakeCrypto
-    models = _module("cat.services.memory.models")
-    if not hasattr(models, "VectorMemoryType"):
-        models.VectorMemoryType = enum.Enum("VectorMemoryType", {"DECLARATIVE": "declarative", "EPISODIC": "episodic"})
-
-
 def setUpModule():
     global config, settings_hooks
-    if PACKAGE not in sys.modules:
-        module = types.ModuleType(PACKAGE)
-        module.__path__ = [str(Path(__file__).resolve().parents[1])]
-        sys.modules[PACKAGE] = module
-    _stub_cat()
-    config = importlib.import_module(f"{PACKAGE}.ingestion.config")
-    settings_hooks = importlib.import_module(f"{PACKAGE}.settings")
+    from cat.looking_glass.mad_hatter.plugin import Plugin
+
+    plugin = Plugin(PLUGIN_PATH)
+    plugin._load_decorated_functions()
+    settings_hooks = sys.modules[plugin.overrides["load_settings"].function.__module__]
+    config = sys.modules[settings_hooks.__name__.rsplit(".", 1)[0] + ".ingestion.config"]
 
 
 class SecretsCodecTest(unittest.TestCase):
@@ -123,6 +99,15 @@ class SettingsHooksTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         STORE.data.clear()
         ERRORS.clear()
+        log = MagicMock()
+        log.error.side_effect = lambda msg, *args, **kwargs: ERRORS.append(msg)
+        for patcher in (
+            patch.object(settings_hooks, "crud_plugins", STORE),
+            patch.object(settings_hooks, "StringCrypto", FakeCrypto),
+            patch.object(settings_hooks, "log", log),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     async def test_save_stores_ciphertext_and_returns_plaintext(self):
         payload = {**config.ConnectorsSettings().model_dump(), "google_oauth_client_secret": "g-secret"}
@@ -145,8 +130,26 @@ class SettingsHooksTest(unittest.IsolatedAsyncioTestCase):
         loaded = await settings_hooks.load_settings.function(PLUGIN_ID, AGENT_ID)
         self.assertEqual((loaded["azure_client_secret"], loaded["max_files_per_job"]), ("a-secret", 9))
 
+    async def test_the_settings_model_and_schema(self):
+        # the loader of the Cat reloads every module: compare the models, not the classes
+        self.assertEqual(settings_hooks.settings_model.function().model_json_schema(), config.ConnectorsSettings.model_json_schema())
+        self.assertEqual(settings_hooks.settings_schema.function(), config.ConnectorsSettings.model_json_schema())
+
     async def test_load_without_stored_settings_returns_defaults(self):
         self.assertEqual(await settings_hooks.load_settings.function(PLUGIN_ID, AGENT_ID), config.ConnectorsSettings().model_dump())
+
+    async def test_defaults_are_json_values_as_the_stored_ones(self):
+        # the stored settings are JSON (Redis): the defaults must have the same shape, e.g. an enum is its value
+        class Mode(enum.Enum):
+            FAST = "fast"
+
+        class Settings(config.ConnectorsSettings):
+            mode: Mode = Mode.FAST
+
+        with patch.object(settings_hooks, "ConnectorsSettings", Settings):
+            loaded = await settings_hooks.load_settings.function(PLUGIN_ID, AGENT_ID)
+        self.assertEqual(loaded["mode"], "fast")
+        self.assertEqual(json.loads(json.dumps(loaded)), loaded)
 
     async def test_load_with_undecryptable_secret_logs_and_disables_it(self):
         STORE.data[(AGENT_ID, PLUGIN_ID)] = {"azure_client_secret": "garbage", "azure_client_id": "cid"}

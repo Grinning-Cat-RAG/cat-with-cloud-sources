@@ -1,12 +1,12 @@
 """Automatic refresh of access tokens (Google Drive, Azure Blob with an Entra ID bearer token).
 
-Run from the plugin root: ``python -m unittest discover -s tests``.
+Run from the root of the Cat core: ``python -m unittest discover -s cat/plugins/cat-with-cloud-sources/tests``.
 
-The plugin modules are imported lazily in ``setUpModule``: the Cat imports every
-``.py`` file of the plugin, and at import time this module needs only the stdlib.
+The Cat imports every ``.py`` file of the plugin, tests included: at import time this module
+needs only the stdlib, the plugin is loaded in ``setUpModule`` with the loader of the Cat.
 """
 import asyncio
-import importlib
+import io
 import json
 import sys
 import types
@@ -22,19 +22,29 @@ FILE_ID = "A" * 12
 TOKEN_HOST = "oauth2.googleapis.com"
 
 
+PLUGIN_PATH = str(Path(__file__).resolve().parents[1])
+
+
+def _plugin_modules():
+    """The modules of the plugin, as the loader of the Cat imports them."""
+    from cat.looking_glass.mad_hatter.plugin import Plugin
+
+    plugin = Plugin(PLUGIN_PATH)
+    plugin._load_decorated_functions()
+    package = plugin.overrides["load_settings"].function.__module__.rsplit(".", 1)[0]
+    return lambda name: sys.modules[f"{package}.{name}"]
+
+
 def setUpModule():
     global base, gd, az, config, httpx, SecretStr
-    package = "cloud_sources_under_test"
-    if package not in sys.modules:
-        module = types.ModuleType(package)
-        module.__path__ = [str(Path(__file__).resolve().parents[1])]
-        sys.modules[package] = module
-    base = importlib.import_module(f"{package}.connectors.base")
-    gd = importlib.import_module(f"{package}.connectors.google_drive")
-    az = importlib.import_module(f"{package}.connectors.azure_blob")
-    config = importlib.import_module(f"{package}.ingestion.config")
-    httpx = importlib.import_module("httpx")
-    SecretStr = importlib.import_module("pydantic").SecretStr
+    import httpx
+    from pydantic import SecretStr
+
+    module = _plugin_modules()
+    base = module("connectors.base")
+    gd = module("connectors.google_drive")
+    az = module("connectors.azure_blob")
+    config = module("ingestion.config")
 
 
 def _in(seconds: int) -> str:
@@ -168,7 +178,7 @@ class TokenRefreshTest(unittest.IsolatedAsyncioTestCase):
 
         connector = await self.connector(self.credential(access_token="old", refresh_token="rt"), handler)
         item = base.SourceItem(provider="google_drive", item_id=FILE_ID, name="f.txt", mime_type="text/plain", version="1")
-        destination = __import__("io").BytesIO()
+        destination = io.BytesIO()
         result = await connector.download(item, destination)
         self.assertEqual(result.bytes_written, 5)
         self.assertEqual(destination.getvalue(), b"hello")

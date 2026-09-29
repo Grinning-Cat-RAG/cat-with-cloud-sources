@@ -1,56 +1,43 @@
 """Scope enforcement: whatever the credential allows, only the requested references are listed and downloaded.
 
-Run from the plugin root: ``python -m unittest discover -s tests``.
+Run from the root of the Cat core: ``python -m unittest discover -s cat/plugins/cat-with-cloud-sources/tests``.
 
-The plugin modules are imported lazily in ``setUpModule``: the Cat imports every
-``.py`` file of the plugin, and at import time this module needs only the stdlib.
+The Cat imports every ``.py`` file of the plugin, tests included: at import time this module
+needs only the stdlib, the plugin is loaded in ``setUpModule`` with the loader of the Cat.
 """
-import enum
-import importlib
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from urllib.parse import unquote
 
 base = gd = s3 = az = pu = pipeline = config = httpx = None
 
-PACKAGE = "cloud_sources_under_test"
+PLUGIN_PATH = str(Path(__file__).resolve().parents[1])
 
 
-def _stub_cat() -> None:
-    """Minimal ``cat`` package, enough to import the ingestion pipeline without a running Cat."""
-    if "cat" in sys.modules:
-        return
-    noop = lambda *args, **kwargs: None  # noqa: E731
-    cat = types.ModuleType("cat")
-    cat.log = types.SimpleNamespace(info=noop, warning=noop, error=noop, debug=noop)
-    models = types.ModuleType("cat.services.memory.models")
-    models.VectorMemoryType = enum.Enum("VectorMemoryType", {"DECLARATIVE": "declarative", "EPISODIC": "episodic"})
-    sys.modules.update({
-        "cat": cat,
-        "cat.services": types.ModuleType("cat.services"),
-        "cat.services.memory": types.ModuleType("cat.services.memory"),
-        "cat.services.memory.models": models,
-    })
+def _plugin_modules():
+    """The modules of the plugin, as the loader of the Cat imports them."""
+    from cat.looking_glass.mad_hatter.plugin import Plugin
+
+    plugin = Plugin(PLUGIN_PATH)
+    plugin._load_decorated_functions()
+    package = plugin.overrides["load_settings"].function.__module__.rsplit(".", 1)[0]
+    return lambda name: sys.modules[f"{package}.{name}"]
 
 
 def setUpModule():
     global base, gd, s3, az, pu, pipeline, config, httpx
-    if PACKAGE not in sys.modules:
-        module = types.ModuleType(PACKAGE)
-        module.__path__ = [str(Path(__file__).resolve().parents[1])]
-        sys.modules[PACKAGE] = module
-    _stub_cat()
-    base = importlib.import_module(f"{PACKAGE}.connectors.base")
-    gd = importlib.import_module(f"{PACKAGE}.connectors.google_drive")
-    s3 = importlib.import_module(f"{PACKAGE}.connectors.s3")
-    az = importlib.import_module(f"{PACKAGE}.connectors.azure_blob")
-    pu = importlib.import_module(f"{PACKAGE}.connectors.presigned_url")
-    pipeline = importlib.import_module(f"{PACKAGE}.ingestion.pipeline")
-    config = importlib.import_module(f"{PACKAGE}.ingestion.config")
-    httpx = importlib.import_module("httpx")
+    import httpx
+
+    module = _plugin_modules()
+    base = module("connectors.base")
+    gd = module("connectors.google_drive")
+    s3 = module("connectors.s3")
+    az = module("connectors.azure_blob")
+    pu = module("connectors.presigned_url")
+    pipeline = module("ingestion.pipeline")
+    config = module("ingestion.config")
 
 
 def _options():
