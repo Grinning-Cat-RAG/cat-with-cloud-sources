@@ -27,7 +27,7 @@ Each request starts a background job with two phases:
 1. **Collect**, which needs the credential. The job lists the referenced items, skips those already ingested at the same version and downloads the rest into a private temporary directory. Then the connector is closed and the credential is dropped.
 2. **Ingest**, which runs without the credential. Each file goes through the RabbitHole of the Cat. The chunks of the previous version are deleted only after the new version is confirmed in memory.
 
-Each item keeps one copy in memory. If two jobs ingest the same version at the same time, the copy of the job with the greatest `job_id` survives. If a vector DB error stops the removal of an old version, the next job that finds the item unchanged removes it.
+Each item keeps one copy in memory: the one written last. Concurrent jobs on the same item never leave it empty. If a late job writes an older version after a newer one, the next job finds the item changed and ingests the current version again. If a vector DB error stops the removal of an old copy, the next job that finds the item unchanged removes it.
 
 A slow embedding phase therefore cannot outlive the token, and a failed ingestion never loses the existing content.
 
