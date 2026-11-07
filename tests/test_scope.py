@@ -295,8 +295,8 @@ class PipelineScopeTest(unittest.IsolatedAsyncioTestCase):
                 return base.DownloadResult(bytes_written=4, mime_type="text/plain")
 
         class NoPoints:
-            async def has_points(self, metadata_filter):
-                return False
+            async def point_metadata(self, metadata_filter):
+                return {}
 
         job = pipeline.IngestionJob(
             job_id="job", provider="fake", references=["ref"], recursive=True, visibility="owner",

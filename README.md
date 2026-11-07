@@ -25,7 +25,9 @@ Frontend ──login──▶ Backend ──(API key + X-User-ID + X-Agent-ID)�
 Each request starts a background job with two phases:
 
 1. **Collect**, which needs the credential. The job lists the referenced items, skips those already ingested at the same version and downloads the rest into a private temporary directory. Then the connector is closed and the credential is dropped.
-2. **Ingest**, which runs without the credential. Each file goes through the configured ingestion engine. The chunks of the previous version are deleted only after the new version is confirmed in memory.
+2. **Ingest**, which runs without the credential. Each file goes through the RabbitHole of the Cat. The chunks of the previous version are deleted only after the new version is confirmed in memory.
+
+Each item keeps one copy in memory. If two jobs ingest the same version at the same time, the copy of the job with the greatest `job_id` survives. If a vector DB error stops the removal of an old version, the next job that finds the item unchanged removes it.
 
 A slow embedding phase therefore cannot outlive the token, and a failed ingestion never loses the existing content.
 
@@ -110,7 +112,7 @@ Response (`202`):
 { "job_id": "9f1c...", "provider": "google_drive", "references": 2, "visibility": "owner", "scope": "agent", "info": "..." }
 ```
 
-Invalid or expired credentials, malformed references and URLs outside the allowed hosts are rejected with `400` before the job starts. The job outcome is logged with its `job_id`: discovered, unchanged, unsupported, over limit, downloaded, ingested, failed and out-of-scope counts, plus `truncated` when a limit stopped the enumeration and `aborted` with the reason when the job stopped early (for example, an expired credential). The Cat's standard ingestion hooks and webhooks keep working, because files go through the regular ingestion engine.
+Invalid or expired credentials, malformed references and URLs outside the allowed hosts are rejected with `400` before the job starts. The job outcome is logged with its `job_id`: discovered, unchanged, unsupported, over limit, downloaded, ingested, failed and out-of-scope counts, plus `truncated` when a limit stopped the enumeration and `aborted` with the reason when the job stopped early (for example, an expired credential). The Cat's standard ingestion hooks (`before_rabbithole_stores_documents`, `after_rabbithole_stored_documents`) and the webhooks keep working, because files go through the regular RabbitHole; as for any upload, `after_rabbithole_stored_documents` also fires for a failed file, with an empty list of points.
 
 ### `GET /custom/connectors/providers`
 

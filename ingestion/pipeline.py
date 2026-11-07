@@ -4,8 +4,8 @@ Phase 1 (needs the credential): enumerate, drop items outside the requested
 references, skip unchanged items, download into a private temporary directory.
 When it ends the connector is closed and the credential reference is dropped.
 
-Phase 2 (no credential): ingest every downloaded file through the configured
-ingestion engine, then remove the chunks of the previous version of the item.
+Phase 2 (no credential): ingest every downloaded file through the RabbitHole of
+the Cat, then remove the chunks of the previous version of the item.
 Old chunks are deleted only after the new version is confirmed in memory, so a
 failed ingestion never loses the existing content.
 
@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Set, Type
+from typing import Any, Dict, List, Set, Tuple, Type
 
 from cat import log
 from cat.services.memory.models import VectorMemoryType
@@ -124,22 +124,18 @@ class PointIndex:
         self._chat_id = chat_id
         self._collection = str(VectorMemoryType.EPISODIC if chat_id else VectorMemoryType.DECLARATIVE)
 
-    async def point_ids(self, metadata_filter: Dict[str, Any]) -> Set[str]:
-        ids: Set[str] = set()
+    async def point_metadata(self, metadata_filter: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """The metadata of every matching point, by point id."""
+        points: Dict[str, Dict[str, Any]] = {}
         offset = None
         while True:
             records, offset = await self._handler.get_all_tenant_points(
                 self._collection, limit=self.PAGE_SIZE, offset=offset, metadata=metadata_filter, with_vectors=False,
             )
-            ids.update(str(r.id) for r in records)
+            for record in records:
+                points[str(record.id)] = dict((record.payload or {}).get("metadata") or {})
             if not offset or not records:
-                return ids
-
-    async def has_points(self, metadata_filter: Dict[str, Any]) -> bool:
-        records, _ = await self._handler.get_all_tenant_points(
-            self._collection, limit=1, metadata=metadata_filter, with_vectors=False,
-        )
-        return bool(records)
+                return points
 
     async def delete_ids(self, ids: Set[str]) -> None:
         if ids:
@@ -151,7 +147,7 @@ class ConnectorIngestionPipeline:
         """
         Args:
             ccat: the CheshireCat of the agent (vector memory owner).
-            target: the object passed to the ingestion engine: the StrayCat for chat-scoped
+            target: the object passed to the RabbitHole: the StrayCat for chat-scoped
                 ingestion, otherwise the CheshireCat.
         """
         self._ccat = ccat
@@ -231,20 +227,19 @@ class ConnectorIngestionPipeline:
                             continue
 
                         identity = md.identity_filter(job.provider, item.item_id, job.owner, job.chat_id)
-                        if await index.has_points({**identity, md.KEY_VERSION: item.version}):
-                            report.unchanged += 1
+                        unchanged = await self._unchanged(index, identity, item, item.version, report)
+                        if unchanged is not False:
                             continue
 
                         entry = await self._download(connector, item, job, workdir, report)
                         if entry is None:
                             continue
-                        if entry.version != item.version and await index.has_points(
-                            {**identity, md.KEY_VERSION: entry.version}
-                        ):
+                        if entry.version != item.version:
                             # version known only after the download (e.g. pre-signed URLs)
-                            _silent_remove(entry.path)
-                            report.unchanged += 1
-                            continue
+                            unchanged = await self._unchanged(index, identity, item, entry.version, report)
+                            if unchanged is not False:
+                                _silent_remove(entry.path)
+                                continue
                         if total_bytes + entry.result.bytes_written > settings.max_total_bytes:
                             os.remove(entry.path)
                             report.over_limit += 1
@@ -264,6 +259,33 @@ class ConnectorIngestionPipeline:
                     report.add_error(f"reference #{job.references.index(reference) + 1}: {e}")
 
         return downloaded
+
+    async def _unchanged(
+        self, index: PointIndex, identity: Dict[str, Any], item: SourceItem, version: str, report: JobReport
+    ) -> bool | None:
+        """Whether the latest copy of the item in memory is at ``version``; None when the vector memory cannot tell.
+
+        An unchanged item is also the moment to remove the copies a past job could not (see ``_latest_copy``).
+        That cleanup is best effort: on error the item is still unchanged and the next job retries.
+        An item whose latest copy is at another version is ingested again, even if ``version`` is in memory too.
+        """
+        try:
+            points = await index.point_metadata(identity)
+        except Exception as e:  # noqa: BLE001 - one item must not stop the job
+            report.failed += 1
+            report.add_error(f"{item.path or item.item_id}: {type(e).__name__}: {e}")
+            return None
+        latest = _latest_copy(points)
+        if latest is None or points[next(iter(latest))].get(md.KEY_VERSION) != version:
+            return False
+
+        report.unchanged += 1
+        stale = set(points) - latest
+        try:
+            await index.delete_ids(stale)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[connectors] {item.path or item.item_id}: cleanup of {len(stale)} stale chunks failed: {e}")
+        return True
 
     async def _download(
         self, connector: SourceConnector, item: SourceItem, job: IngestionJob, workdir: str, report: JobReport
@@ -303,13 +325,13 @@ class ConnectorIngestionPipeline:
 
     # -- phase 2 ---------------------------------------------------------------
     async def _ingest(self, downloaded: List[_Downloaded], job: IngestionJob, index: PointIndex, report: JobReport):
-        engine = await self._resolve_engine()
+        # the lizard drops the RabbitHole on shutdown: fail the whole phase before touching any item
+        ingest_file = self._ccat.lizard.rabbit_hole.ingest_file
 
         for entry in downloaded:
             item = entry.item
             identity = md.identity_filter(job.provider, item.item_id, job.owner, job.chat_id)
             try:
-                previous_ids = await index.point_ids(identity)
                 metadata = md.build_metadata(
                     provider=job.provider,
                     item_id=item.item_id,
@@ -324,7 +346,7 @@ class ConnectorIngestionPipeline:
                 )
                 content = BytesIO(Path(entry.path).read_bytes())
 
-                await engine(
+                await ingest_file(
                     cat=self._target,
                     file=content,
                     filename=entry.source_name,
@@ -333,31 +355,58 @@ class ConnectorIngestionPipeline:
                     content_type=entry.result.mime_type,
                 )
 
-                # the core engine swallows errors: verify the new version landed
-                current_ids = await index.point_ids({**identity, md.KEY_VERSION: entry.version})
-                if not current_ids:
+                # the RabbitHole swallows errors: verify the new version landed
+                points = await index.point_metadata(identity)
+                landed = any(_job_of(meta) == job.job_id for meta in points.values())
+                in_memory = any(meta.get(md.KEY_VERSION) == entry.version for meta in points.values())
+
+                # one copy per item: the latest one, which may come from a concurrent job
+                latest = _latest_copy(points)
+                if latest is not None:
+                    await index.delete_ids(set(points) - latest)
+
+                if landed:
+                    report.ingested += 1
+                elif in_memory:
+                    report.unchanged += 1  # a concurrent job ingested the same version (and may have replaced ours)
+                else:
                     report.failed += 1
                     report.add_error(f"{item.path or item.item_id}: ingestion produced no chunks")
-                    continue
-
-                await index.delete_ids(previous_ids - current_ids)
-                report.ingested += 1
             except Exception as e:  # noqa: BLE001 - one bad file must not stop the job
                 report.failed += 1
                 report.add_error(f"{item.path or item.item_id}: {type(e).__name__}: {e}")
             finally:
                 _silent_remove(entry.path)
 
-    async def _resolve_engine(self):
-        lizard = self._ccat.lizard
-        try:
-            from cat.services.factory.ingestion import resolve_ingestion_engine
 
-            engine = await resolve_ingestion_engine(lizard)
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"[connectors] ingestion engine not resolvable, using the RabbitHole: {e}")
-            engine = None
-        return engine.ingest_file if engine is not None else lizard.rabbit_hole.ingest_file
+def _job_of(meta: Dict[str, Any]) -> str:
+    return str(meta.get(md.KEY_JOB) or "")
+
+
+def _latest_copy(points: Dict[str, Dict[str, Any]]) -> Set[str] | None:
+    """The point ids of the latest copy of one item, None when there is no point.
+
+    A copy is what one job wrote for the item: the RabbitHole stores it in a single upsert, so every reader sees
+    it whole. Copies are ordered by the newest ``when`` of their points, then by job id. Every job keeps the
+    latest copy it sees and deletes the others. No reader can see a copy later than the latest one in memory,
+    so that copy is never deleted and the item never stays empty, whatever the interleaving of the jobs.
+    The price: a late job can make an older version the latest copy; the next job finds the item changed
+    and ingests the current version again.
+    """
+    copies: Dict[str, Tuple[float, Set[str]]] = {}
+    for pid, meta in points.items():
+        job_id = _job_of(meta)
+        newest, ids = copies.get(job_id, (float("-inf"), set()))
+        ids.add(pid)
+        copies[job_id] = (max(newest, _when(meta)), ids)
+    if not copies:
+        return None
+    return max(copies.items(), key=lambda copy: (copy[1][0], copy[0]))[1][1]
+
+
+def _when(meta: Dict[str, Any]) -> float:
+    # the RabbitHole stamps every chunk with the time.time() of its ingestion
+    return float(meta.get("when") or 0)
 
 
 def _silent_remove(path: str) -> None:
