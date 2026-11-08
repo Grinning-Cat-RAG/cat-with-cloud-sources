@@ -2,10 +2,10 @@
 
 Run from the root of the Cat core: ``python -m unittest discover -s cat/plugins/cat-with-cloud-sources/tests``.
 
-The Cat imports every ``.py`` file of the plugin, tests included: at import time this module
-needs only the stdlib, the plugin and hypothesis are loaded in ``setUpModule``.
+The Cat does not import the tests of a plugin (its security scanner reads them: no dynamic imports); the plugin and hypothesis are loaded in ``setUpModule``.
 """
 import asyncio
+import dataclasses
 import contextvars
 import io
 import itertools
@@ -39,6 +39,9 @@ def _plugin_modules():
 
 def setUpModule():
     global pipeline, base, md
+    import support
+
+    support.use_test_secrets()
     module = _plugin_modules()
     pipeline = module("ingestion.pipeline")
     base = module("connectors.base")
@@ -102,10 +105,15 @@ class FakeVectorMemory:
 
 
 class FakeRabbitHole:
-    """``RabbitHole.ingest_file`` as the core runs it: errors are swallowed, the points land in one upsert."""
+    """The RabbitHole as the core runs it. ``ingest_file``: errors are swallowed, the points land in one upsert, and
+    the source gets its state (kept in ``sources``: the core would ingest it again on a change of the embedder or of
+    the chunker). ``delete_source``: the state goes, with every point of the source, once ``before`` ran."""
 
     def __init__(self, memory: FakeVectorMemory):
         self._memory = memory
+        self.sources = set()  # the sources whose kept chunks the core would embed again
+        self.deleted = []  # (source, chat_id, wait) of every deletion
+        self.busy = set()  # sources held by another worker: their deletion fails
         self._ids = itertools.count()
         self._clock = itertools.count(1)
         self.calls = []
@@ -127,11 +135,44 @@ class FakeRabbitHole:
         # the core stamps the chunks before embedding them, with the clock of its pod
         when = float(next(self._clock)) + self.skew.get(job_id, 0)
         if await self._memory.gates.wait() or not self.produce.get(job_id, self.produce_chunks):
-            return None  # the core logs the error and returns
+            return None  # the core logs the error and returns: a state in error, with nothing that could come back
         # the chunks, plus the catalogue card a plugin may add with the metadata of the first chunk
+        # the core stamps the chat of a chat-scoped ingestion (the target is its StrayCat)
+        chat = {"chat_id": cat.id} if getattr(cat, "id", None) else {}
         for _ in range(self.chunks + 1):
-            self._memory.points[f"p{next(self._ids)}"] = {**metadata, "source": filename, "when": when}
+            self._memory.points[f"p{next(self._ids)}"] = {**metadata, "source": filename, "when": when, **chat}
+        self.sources.add(filename)
         return None
+
+
+    async def delete_source(self, cat, name, chat_id=None, wait=None, before=None):
+        if await self._memory.gates.wait() or name in self.busy:
+            raise VectorDBDown(f"the source {name} is busy")
+        await before()
+        self.deleted.append((name, chat_id, wait))
+        self.sources.discard(name)
+        # a source of the knowledge base, or of one chat (``RabbitHole._source_filter``)
+        for pid in [
+            pid for pid, meta in self._memory.points.items()
+            if meta.get("source") == name and meta.get("chat_id") == chat_id
+        ]:
+            del self._memory.points[pid]
+
+
+class FakeCat:
+    """The CheshireCat of the agent: its storage and the hooks of its plugins."""
+
+    def __init__(self, memory, rabbit_hole):
+        self.agent_key = "agent"
+        self.vector_memory_handler = memory
+        self.lizard = SimpleNamespace(rabbit_hole=rabbit_hole)
+        self.removed_files = []
+        self.hooks = []
+        self.file_manager = SimpleNamespace(remove_file=self.removed_files.append)
+        self.plugin_manager = SimpleNamespace(execute_hook=self._hook)
+
+    async def _hook(self, name, *args, caller):
+        self.hooks.append((name, *args))
 
 
 class FakeConnector:
@@ -171,7 +212,7 @@ def _settings(store_files=False):
 
 
 def _make_pipeline(memory, rabbit_hole, store_files=False):
-    ccat = SimpleNamespace(vector_memory_handler=memory, lizard=SimpleNamespace(rabbit_hole=rabbit_hole))
+    ccat = FakeCat(memory, rabbit_hole)
     return pipeline.ConnectorIngestionPipeline(ccat, ccat, _settings(store_files), {"text/plain"}), ccat
 
 
@@ -182,7 +223,7 @@ def _job(job_id="job-1", references=("bucket/doc.txt",)):
     )
 
 
-def _downloaded(workdir, item_id, version, content=b"hello", tag=""):
+def _downloaded(workdir, item_id, version, content=b"hello", tag="", source_name=None):
     path = os.path.join(workdir, f"{item_id}-{version}{tag}.bin")
     Path(path).write_bytes(content)
     item = base.SourceItem(
@@ -190,7 +231,7 @@ def _downloaded(workdir, item_id, version, content=b"hello", tag=""):
         path=f"bucket/{item_id}.txt",
     )
     result = base.DownloadResult(bytes_written=len(content), mime_type="text/plain", extension=".txt")
-    return pipeline._Downloaded(item=item, path=path, result=result, source_name=f"{item_id}.txt")
+    return pipeline._Downloaded(item=item, path=path, result=result, source_name=source_name or f"{item_id}.txt")
 
 
 def _groups(memory, item_id):
@@ -272,6 +313,103 @@ class IngestPhaseTest(unittest.TestCase):
         self.assertIn("ingestion produced no chunks", report.errors[0])
         self.assertEqual(_versions(self.memory, "item-a"), {"v1"})
         self.assertFalse(os.path.exists(entry.path))
+
+    def test_a_renamed_item_removes_its_old_source_from_the_core(self):
+        # e.g. a renamed Google document: a new version under a new source name
+        self._run(_downloaded(self.workdir, "item-a", "v1", source_name="old.txt"))
+        report = self._run(_downloaded(self.workdir, "item-a", "v2", source_name="new.txt"), job=_job("job-2"))
+
+        self.assertEqual((report.ingested, report.failed), (1, 0))
+        self.assertEqual(_groups(self.memory, "item-a"), {("v2", "job-2")})
+        # the state, the kept chunks and the stored file of the old source go: nothing can bring it back
+        self.assertEqual(self.rabbit_hole.sources, {"new.txt"})
+        self.assertEqual(self.rabbit_hole.deleted, [("old.txt", None, pipeline.DELETE_WAIT_SECONDS)])
+        self.assertEqual(self.ccat.removed_files, [os.path.join("agent", "old.txt")])
+        self.assertEqual(self.ccat.hooks, [
+            ("before_file_manager_file_delete", "old.txt", "agent"),
+            ("after_file_manager_file_deleted", "old.txt", "agent"),
+        ])
+
+    def test_the_old_source_of_a_chat_is_removed_from_the_chat(self):
+        index = pipeline.PointIndex(self.ccat, "chat-1")
+        asyncio.run(self.pipe._delete_source(index, "old.txt", set()))
+        self.assertEqual(self.rabbit_hole.deleted, [("old.txt", "chat-1", pipeline.DELETE_WAIT_SECONDS)])
+        self.assertEqual(self.ccat.removed_files, [os.path.join("agent", "chat-1", "old.txt")])
+        self.assertEqual(self.ccat.hooks[0], ("before_file_manager_file_delete", "old.txt", "chat-1"))
+
+    def test_an_old_source_with_a_newer_copy_meanwhile_is_kept(self):
+        # a concurrent job wrote a copy under the old name after this job read the points
+        self._run(_downloaded(self.workdir, "item-a", "v1", source_name="old.txt"))
+        original = self.memory.get_all_tenant_points
+        written = []
+
+        async def concurrent_write(collection, limit, offset=None, metadata=None, with_vectors=False):
+            if metadata == {"source": "old.txt"} and not written:
+                written.append(True)
+                self.memory.points["late"] = {
+                    md.KEY_ITEM_ID: "item-a", md.KEY_VERSION: "v3", md.KEY_JOB: "job-late", "source": "old.txt",
+                    "when": 99.0,
+                }
+            return await original(collection, limit, offset, metadata, with_vectors)
+
+        self.memory.get_all_tenant_points = concurrent_write
+        report = self._run(_downloaded(self.workdir, "item-a", "v2", source_name="new.txt"), job=_job("job-2"))
+
+        self.assertEqual((report.ingested, report.failed), (1, 0))
+        self.assertIn("old.txt", self.rabbit_hole.sources)
+        self.assertIn("late", self.memory.points)
+        self.assertEqual((self.rabbit_hole.deleted, self.ccat.removed_files, self.ccat.hooks), ([], [], []))
+
+    def test_a_renamed_item_of_a_chat_leaves_the_other_chats_alone(self):
+        # the same document ingested by the same user in two chats has the same source name in both
+        def ingest(chat_id, version, source_name, job_id):
+            target = SimpleNamespace(id=chat_id)
+            pipe = pipeline.ConnectorIngestionPipeline(self.ccat, target, _settings(True), {"text/plain"})
+            job = dataclasses.replace(_job(job_id), chat_id=chat_id)
+            report = pipeline.JobReport(job_id=job_id, provider=PROVIDER)
+            entry = _downloaded(self.workdir, "item-a", version, tag=job_id, source_name=source_name)
+            asyncio.run(pipe._ingest([entry], job, pipeline.PointIndex(self.ccat, chat_id), report))
+            return report
+
+        ingest("chat-1", "v1", "old.txt", "job-1")
+        ingest("chat-2", "v1", "old.txt", "job-2")
+        report = ingest("chat-1", "v2", "new.txt", "job-3")
+
+        self.assertEqual((report.ingested, report.failed), (1, 0))
+        self.assertEqual(self.rabbit_hole.deleted, [("old.txt", "chat-1", pipeline.DELETE_WAIT_SECONDS)])
+        chats = {(meta["chat_id"], meta["source"]) for meta in self.memory.points.values()}
+        self.assertEqual(chats, {("chat-1", "new.txt"), ("chat-2", "old.txt")})
+
+    def test_the_same_source_name_drops_only_points(self):
+        self._run(_downloaded(self.workdir, "item-a", "v1"))
+        self._run(_downloaded(self.workdir, "item-a", "v2"), job=_job("job-2"))
+        self.assertEqual(self.rabbit_hole.deleted, [])
+        self.assertEqual(_groups(self.memory, "item-a"), {("v2", "job-2")})
+
+    def test_an_old_source_busy_is_removed_by_the_next_job(self):
+        self._scan("item-a", "v1", job_id="job-1")
+        old = next(iter(self.rabbit_hole.sources))
+        self.rabbit_hole.busy.add(old)
+        report = self._run(_downloaded(self.workdir, "item-a", "v2", source_name="new.txt"), job=_job("job-2"))
+        self.assertEqual(report.failed, 1)
+        self.assertEqual(_versions(self.memory, "item-a"), {"v1", "v2"})
+
+        self.rabbit_hole.busy.clear()
+        report = self._run(_downloaded(self.workdir, "item-a", "v2", source_name="new.txt"), job=_job("job-3"))
+        self.assertEqual(self.rabbit_hole.sources, {"new.txt"})
+        self.assertEqual(_versions(self.memory, "item-a"), {"v2"})
+
+    def test_an_unchanged_item_removes_the_old_source_left_behind(self):
+        self._run(_downloaded(self.workdir, "item-a", "v1", source_name="old.txt"))
+        self.rabbit_hole.busy.add("old.txt")
+        self._run(_downloaded(self.workdir, "item-a", "v2"), job=_job("job-2"))
+        self.rabbit_hole.busy.clear()
+
+        report = self._scan_ref("item-a@v2", "job-3")
+
+        self.assertEqual((report.unchanged, report.failed), (1, 0))
+        self.assertNotIn("old.txt", self.rabbit_hole.sources)
+        self.assertEqual(_versions(self.memory, "item-a"), {"v2"})
 
     def test_vector_db_error_fails_the_item_and_continues(self):
         self.memory.fail_reads = True
@@ -596,13 +734,19 @@ def _stateful_case():
             self.confirmed = True
             groups = _groups(self.memory, "item")
             assert len(groups) == 1 and next(iter(groups))[0] == current, (current, groups)
+            # one source in the core too: an old source name left with its state would come back on a change of the
+            # embedder or of the chunker (the jobs below name the item differently, as a renamed item)
+            sources = {meta["source"] for meta in self.memory.points.values() if meta.get(md.KEY_ITEM_ID) == "item"}
+            assert self.rabbit_hole.sources == sources, (self.rabbit_hole.sources, sources)
 
         @invariant()
         def never_empty_once_confirmed(self):
             if self.confirmed:
                 assert _groups(self.memory, "item"), "the item lost all its content"
 
-    ConcurrentJobsMachine.TestCase.settings = h_settings(max_examples=300, stateful_step_count=40, deadline=None)
+    ConcurrentJobsMachine.TestCase.settings = h_settings(
+        max_examples=1500, stateful_step_count=40, deadline=None, derandomize=True,
+    )
     return ConcurrentJobsMachine.TestCase
 
 

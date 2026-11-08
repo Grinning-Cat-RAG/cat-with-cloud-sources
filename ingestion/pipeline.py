@@ -5,15 +5,17 @@ references, skip unchanged items, download into a private temporary directory.
 When it ends the connector is closed and the credential reference is dropped.
 
 Phase 2 (no credential): ingest every downloaded file through the RabbitHole of
-the Cat, then remove the chunks of the previous version of the item.
-Old chunks are deleted only after the new version is confirmed in memory, so a
-failed ingestion never loses the existing content.
+the Cat, then remove the chunks of the previous version of the item (with its
+whole source in the Cat, when the item was renamed). Old chunks are deleted only
+after the new version is confirmed in memory, so a failed ingestion never loses
+the existing content.
 
 Splitting the phases keeps the credential lifetime short: embedding can take
 far longer than a user access token lives.
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import itertools
 import os
@@ -26,6 +28,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple, Type
 
 from cat import log
+from cat.rabbit_hole import DELETE_WAIT_SECONDS
+from cat.rabbit_hole.chunks import owner_folder
 from cat.services.memory.models import VectorMemoryType
 
 from ..connectors.base import (
@@ -121,7 +125,7 @@ class PointIndex:
 
     def __init__(self, ccat, chat_id: str | None):
         self._handler = ccat.vector_memory_handler
-        self._chat_id = chat_id
+        self.chat_id = chat_id
         self._collection = str(VectorMemoryType.EPISODIC if chat_id else VectorMemoryType.DECLARATIVE)
 
     async def point_metadata(self, metadata_filter: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -280,12 +284,50 @@ class ConnectorIngestionPipeline:
             return False
 
         report.unchanged += 1
-        stale = set(points) - latest
         try:
-            await index.delete_ids(stale)
+            await self._drop_copies(index, points, latest)
         except Exception as e:  # noqa: BLE001
-            log.warning(f"[connectors] {item.path or item.item_id}: cleanup of {len(stale)} stale chunks failed: {e}")
+            log.warning(f"[connectors] {item.path or item.item_id}: cleanup of the stale copies failed: {e}")
         return True
+
+    async def _drop_copies(self, index: PointIndex, points: Dict[str, Dict[str, Any]], latest: Set[str]) -> None:
+        """Remove every copy of an item but the latest one.
+
+        A copy under the source name of the latest one is just points (the core replaces them at every ingestion of
+        that source). A copy under another source name (the item was renamed, e.g. a Google document) is a source of
+        its own in the core, with its ingestion state and its kept chunks, which a change of the embedder or of the
+        chunker would bring back: it is deleted through the core, with its stored file.
+        """
+        latest_source = points[next(iter(latest))].get("source")
+        stale = set(points) - latest
+        for source in sorted({points[pid].get("source") for pid in stale} - {latest_source, None}):
+            try:
+                await self._delete_source(index, source, {pid for pid in stale if points[pid].get("source") == source})
+            except _SourceChanged:
+                pass  # a concurrent job wrote a newer copy under that name meanwhile: it is not stale anymore
+        await index.delete_ids({pid for pid in stale if points[pid].get("source") in (latest_source, None)})
+
+    async def _delete_source(self, index: PointIndex, source: str, stale: Set[str]) -> None:
+        """Delete a source as the file manager routes of the core do: holding its lock (``SourceBusy`` while it is
+        ingested: the next job retries), its stored file first and the plugins notified, then what its ingestion
+        produced and its state. The deletion goes by source, not by point: holding the lock, no ingestion of the source
+        can interleave, and the source must still hold only the ``stale`` points seen before (``_SourceChanged``
+        otherwise: a concurrent job wrote a newer copy under that name, which must stay)."""
+        ccat = self._ccat
+        chat_id = index.chat_id
+        folder = owner_folder(ccat.agent_key, chat_id)
+        scope = chat_id or "agent"
+
+        async def remove_file():
+            # the source of this scope only: the same source name may live in another chat (the core filters the same)
+            scoped = {"source": source} | ({"chat_id": chat_id} if chat_id else {})
+            if set(await index.point_metadata(scoped)) - stale:
+                raise _SourceChanged(source)
+            await asyncio.to_thread(ccat.file_manager.remove_file, os.path.join(folder, source))
+            await ccat.plugin_manager.execute_hook("before_file_manager_file_delete", source, scope, caller=ccat)
+
+        await ccat.lizard.rabbit_hole.delete_source(ccat, source, chat_id, wait=DELETE_WAIT_SECONDS, before=remove_file)
+        await ccat.plugin_manager.execute_hook("after_file_manager_file_deleted", source, scope, caller=ccat)
 
     async def _download(
         self, connector: SourceConnector, item: SourceItem, job: IngestionJob, workdir: str, report: JobReport
@@ -363,7 +405,7 @@ class ConnectorIngestionPipeline:
                 # one copy per item: the latest one, which may come from a concurrent job
                 latest = _latest_copy(points)
                 if latest is not None:
-                    await index.delete_ids(set(points) - latest)
+                    await self._drop_copies(index, points, latest)
 
                 if landed:
                     report.ingested += 1
@@ -377,6 +419,10 @@ class ConnectorIngestionPipeline:
                 report.add_error(f"{item.path or item.item_id}: {type(e).__name__}: {e}")
             finally:
                 _silent_remove(entry.path)
+
+
+class _SourceChanged(Exception):
+    """A source about to be deleted got a newer copy meanwhile."""
 
 
 def _job_of(meta: Dict[str, Any]) -> str:

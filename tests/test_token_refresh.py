@@ -2,8 +2,7 @@
 
 Run from the root of the Cat core: ``python -m unittest discover -s cat/plugins/cat-with-cloud-sources/tests``.
 
-The Cat imports every ``.py`` file of the plugin, tests included: at import time this module
-needs only the stdlib, the plugin is loaded in ``setUpModule`` with the loader of the Cat.
+The Cat does not import the tests of a plugin (its security scanner reads them: no dynamic imports); the plugin is loaded in ``setUpModule`` with the loader of the Cat.
 """
 import asyncio
 import io
@@ -37,6 +36,9 @@ def _plugin_modules():
 
 def setUpModule():
     global base, gd, az, config, httpx, SecretStr
+    import support
+
+    support.use_test_secrets()
     import httpx
     from pydantic import SecretStr
 

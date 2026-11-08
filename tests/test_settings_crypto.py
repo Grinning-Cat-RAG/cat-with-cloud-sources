@@ -2,8 +2,7 @@
 
 Run from the root of the Cat core: ``python -m unittest discover -s cat/plugins/cat-with-cloud-sources/tests``.
 
-The Cat imports every ``.py`` file of the plugin, tests included: at import time this module
-needs only the stdlib, the plugin is loaded in ``setUpModule`` with the loader of the Cat.
+The Cat does not import the tests of a plugin (its security scanner reads them: no dynamic imports); the plugin is loaded in ``setUpModule`` with the loader of the Cat.
 """
 import enum
 import json
@@ -57,6 +56,9 @@ ERRORS = []
 
 def setUpModule():
     global config, settings_hooks
+    import support
+
+    support.use_test_secrets()
     from cat.looking_glass.mad_hatter.plugin import Plugin
 
     plugin = Plugin(PLUGIN_PATH)

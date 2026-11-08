@@ -29,6 +29,8 @@ Each request starts a background job with two phases:
 
 Each item keeps one copy in memory: the one written last. Concurrent jobs on the same item never leave it empty. If a late job writes an older version after a newer one, the next job finds the item changed and ingests the current version again. If a vector DB error stops the removal of an old copy, the next job that finds the item unchanged removes it.
 
+A renamed item (e.g. a Google document: its new version gets a new source name) leaves its old copy under the old name, a source of its own in the Cat, which a change of the embedder or of the chunker would bring back: it is removed through the Cat, as a deleted file, with its stored file, its ingestion state and its kept chunks. If the old source is busy (being ingested or re-embedded), the item counts as failed although the new version is in memory, and the next job removes it.
+
 A slow embedding phase therefore cannot outlive the token, and a failed ingestion never loses the existing content.
 
 ### Token expiry
@@ -112,7 +114,7 @@ Response (`202`):
 { "job_id": "9f1c...", "provider": "google_drive", "references": 2, "visibility": "owner", "scope": "agent", "info": "..." }
 ```
 
-Invalid or expired credentials, malformed references and URLs outside the allowed hosts are rejected with `400` before the job starts. The job outcome is logged with its `job_id`: discovered, unchanged, unsupported, over limit, downloaded, ingested, failed and out-of-scope counts, plus `truncated` when a limit stopped the enumeration and `aborted` with the reason when the job stopped early (for example, an expired credential). The Cat's standard ingestion hooks (`before_rabbithole_stores_documents`, `after_rabbithole_stored_documents`) and the webhooks keep working, because files go through the regular RabbitHole; as for any upload, `after_rabbithole_stored_documents` also fires for a failed file, with an empty list of points.
+Invalid or expired credentials, malformed references and URLs outside the allowed hosts are rejected with `400` before the job starts. The job outcome is logged with its `job_id`: discovered, unchanged, unsupported, over limit, downloaded, ingested, failed and out-of-scope counts, plus `truncated` when a limit stopped the enumeration and `aborted` with the reason when the job stopped early (for example, an expired credential). The Cat's standard ingestion hooks (`before_rabbithole_stores_documents`, `after_rabbithole_stored_documents`) and the webhooks keep working, because files go through the regular RabbitHole; as for any upload, `after_rabbithole_stored_documents` also fires for a failed file, with an empty list of points. The removal of the old source of a renamed item fires `before_file_manager_file_delete` and `after_file_manager_file_deleted`, as the deletion of a file does.
 
 ### `GET /custom/connectors/providers`
 
@@ -235,7 +237,7 @@ sas = generate_container_sas(account, container, user_delegation_key=key,
 | `max_items_scanned`      | 20000   | Stops listing very large folders, buckets or containers              |
 | `max_file_size_mb`       | 50      | Enforced while streaming, even when the provider does not report the size |
 | `max_total_size_mb`      | 1024    | Total downloaded bytes per job                                       |
-| `store_files`            | true    | Keep files in the Cat storage (needed to re-embed on embedder change) |
+| `store_files`            | true    | Keep files in the Cat storage (needed to process them again on a chunker change; an embedder change re-embeds the chunks kept by the Cat) |
 | `enforce_owner_acl`      | true    | Apply the visibility filter on recall                                |
 | `default_visibility`     | owner   | Used when the request does not specify it                            |
 | `allow_agent_visibility` | true    | If false, requests with `visibility: agent` are refused (403)        |

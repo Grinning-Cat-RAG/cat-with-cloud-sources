@@ -29,7 +29,10 @@ class ConnectorsSettings(BaseModel):
     store_files: bool = Field(
         default=True,
         title="Store files in the Cat storage",
-        description="Needed to re-embed the documents when the embedder changes.",
+        description=(
+            "Needed to process the documents again when the chunker changes: a change of the embedder re-embeds "
+            "the chunks kept by the Cat, without the files."
+        ),
     )
     enforce_owner_acl: bool = Field(
         default=True,
